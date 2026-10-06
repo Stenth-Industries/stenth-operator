@@ -18,8 +18,10 @@
 #   2. Its own bridge network, project-scoped by that name.
 #   3. A mem_limit on every container. The box has ~2.7 GB free of 4 GB, and an
 #      Operator container that balloons must hit its own ceiling rather than
-#      starve the client's n8n. The limits below total 1.65 GB and leave the
-#      existing stack its headroom.
+#      starve the client's n8n. Steady state is postgres 1 GiB + web 512 MiB +
+#      worker 384 MiB = 1.875 GiB; the migration step adds 256 MiB while it
+#      runs. A cold image build needs roughly another 850 MiB, measured, so
+#      builds happen with the stack down (ops/deploy.md).
 #
 # Ports 80 and 443 are already published by the existing Caddy, so Operator
 # cannot bind them as §20 describes. That is an open deviation awaiting a
@@ -87,6 +89,38 @@ services:
     networks:
       - internal
     restart: "no"
+
+  # The single Node worker of §6: four handlers in-process, plus one timer
+  # running the scheduler and the reaper. Internal network only, no host port.
+  worker:
+    build:
+      context: .
+      target: worker
+      secrets:
+        - npm_ca
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: worker
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: ${DATABASE_URL}
+      # The scheduler connects as operator_sched so §17's least privilege is
+      # enforced by the connection, not by which statements it happens to run.
+      #
+      # Deliberately not ${...:?required}: that marker makes EVERY compose
+      # command fail when the variable is missing, `down` and `logs` included,
+      # so one absent line in .env would leave the stack un-stoppable. The
+      # worker checks this itself at startup and exits with an explanation,
+      # which fails just as fast and leaves the box operable.
+      SCHED_DATABASE_URL: ${SCHED_DATABASE_URL}
+      NODE_OPTIONS: --max-old-space-size=256
+    mem_limit: 384m
+    memswap_limit: 384m
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
 
   web:
     build:

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { getTableName, is } from 'drizzle-orm';
@@ -12,10 +12,19 @@ import * as schema from '../../src/db/schema';
  * Drizzle schema has not drifted from it, because a schema that silently
  * disagrees with the database is worse than no schema at all.
  */
-const init = readFileSync(join(__dirname, '..', '..', 'migrations', '001_init.sql'), 'utf8');
+const migrationsDir = join(__dirname, '..', '..', 'migrations');
+
+/** Every migration, so a table added by a later one is covered too. */
+const allMigrations = readdirSync(migrationsDir)
+  .filter((name) => name.endsWith('.sql'))
+  .sort()
+  .map((name) => readFileSync(join(migrationsDir, name), 'utf8'))
+  .join('\n');
 
 const sqlTables = new Set(
-  [...init.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(/g)].map((match) => match[1] as string),
+  [...allMigrations.matchAll(/CREATE TABLE IF NOT EXISTS (\w+) \(/g)].map(
+    (match) => match[1] as string,
+  ),
 );
 
 const exported: unknown[] = Object.values(schema);
@@ -37,7 +46,8 @@ describe('schema.ts mirrors migration 001', () => {
     expect(extra).toStrictEqual([]);
   });
 
-  it('covers all 24 tables of §4', () => {
-    expect(drizzleTables.size).toBe(24);
+  it('covers the 24 tables of §4 plus scheduler_heartbeat (migration 003)', () => {
+    expect(drizzleTables.size).toBe(25);
+    expect(drizzleTables.has('scheduler_heartbeat')).toBe(true);
   });
 });

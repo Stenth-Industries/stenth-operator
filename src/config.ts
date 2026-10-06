@@ -32,6 +32,13 @@ const envSchema = z.object({
    */
   ADMIN_DATABASE_URL: postgresUrl.optional(),
 
+  /**
+   * Scheduler connection (operator_sched). Required by the worker: the
+   * scheduler's least privilege is enforced by which role it connects as, not
+   * by which statements it happens to run (§6, §17).
+   */
+  SCHED_DATABASE_URL: postgresUrl.optional(),
+
   /** Role passwords (§17), read by the migration step's bootstrap phase. */
   OPERATOR_APP_PASSWORD: z.string().min(1).optional(),
   OPERATOR_FETCH_PASSWORD: z.string().min(1).optional(),

@@ -140,9 +140,12 @@ export async function collectHealth(pool: Pool): Promise<HealthReport> {
         FROM job_runs
         WHERE status = 'succeeded'
       `),
+      // The heartbeat, not schedules.last_run_at: §20 asks for the age of the
+      // last scheduler *tick*, and a healthy scheduler with nothing due never
+      // touches a schedule row (migration 003).
       pool.query<AgeRow>(`
-        SELECT extract(epoch FROM now() - max(last_run_at)) AS age_seconds
-        FROM schedules
+        SELECT extract(epoch FROM now() - last_tick_at) AS age_seconds
+        FROM scheduler_heartbeat
       `),
       pool.query<SpendRow>(`
         SELECT

@@ -20,8 +20,14 @@ the target host.
 
 | Day | State |
 |---|---|
-| 1 — repo, config, Compose with Postgres, migration 001, five DB roles, `/api/health`, pino with trace ids, CI | Done, except the Tailscale host work (`ops/tailscale.md`) |
-| 2 — job engine and the in-process scheduler | Not started |
+| 1 — repo, config, Compose with Postgres, migration 001, five DB roles, `/api/health`, pino with trace ids, CI | Done and deployed |
+| 2 — job engine: enqueue, claim, retries, backoff, reaper, `job_runs`, events, and the in-process scheduler under an advisory lock | Done |
+| 3 — the fetcher as its own service | Not started |
+
+Day 2 registers no business handlers: each belongs to the day that builds it.
+A claimed job with no handler fails through the ordinary path — retried, then
+dead with an alert — and production has nothing enqueuing and no schedules
+enabled, so the queue stays empty until Day 3 puts work in it.
 
 ## Local development
 

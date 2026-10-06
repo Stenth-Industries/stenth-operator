@@ -100,14 +100,22 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
 
   it('applies every migration on the first run', async () => {
     const result = await apply(pool, loadMigrations(migrationsDir));
-    expect(result.applied).toStrictEqual(['001_init.sql', '002_roles.sql']);
+    expect(result.applied).toStrictEqual([
+      '001_init.sql',
+      '002_roles.sql',
+      '003_scheduler_heartbeat.sql',
+    ]);
     expect(result.skipped).toStrictEqual([]);
   });
 
   it('is idempotent: a second run applies nothing and fails nothing', async () => {
     const result = await apply(pool, loadMigrations(migrationsDir));
     expect(result.applied).toStrictEqual([]);
-    expect(result.skipped).toStrictEqual(['001_init.sql', '002_roles.sql']);
+    expect(result.skipped).toStrictEqual([
+      '001_init.sql',
+      '002_roles.sql',
+      '003_scheduler_heartbeat.sql',
+    ]);
   });
 
   it('is idempotent at the file level too: the raw SQL re-runs cleanly', async () => {
@@ -116,7 +124,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
     const client = await pool.connect();
     try {
       await client.query('SET ROLE operator_migrate');
-      for (const file of ['001_init.sql', '002_roles.sql']) {
+      for (const file of ['001_init.sql', '002_roles.sql', '003_scheduler_heartbeat.sql']) {
         await client.query(readFileSync(join(migrationsDir, file), 'utf8'));
       }
     } finally {
@@ -142,8 +150,10 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
     for (const table of SPEC_TABLES) {
       expect(present.has(table), `${table} is missing`).toBe(true);
     }
-    // Plus the migration ledger, which is infrastructure rather than §4 schema.
-    expect(present.size).toBe(SPEC_TABLES.length + 1);
+    // Plus scheduler_heartbeat (migration 003) and the migration ledger, which
+    // is infrastructure rather than §4 schema.
+    expect(present.has('scheduler_heartbeat')).toBe(true);
+    expect(present.size).toBe(SPEC_TABLES.length + 2);
   });
 
   it('creates the five roles of §17', async () => {

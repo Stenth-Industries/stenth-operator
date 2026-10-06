@@ -613,6 +613,18 @@ export const practiceAreaPriors = pgTable(
   ],
 );
 
+/**
+ * Liveness of the in-process scheduler (migration 003, §6, §20).
+ *
+ * One row. Distinct from schedules.last_run_at: this records that the scheduler
+ * ticked, which is true even when nothing was due.
+ */
+export const schedulerHeartbeat = pgTable('scheduler_heartbeat', {
+  id: boolean('id').primaryKey().default(true),
+  lastTickAt: timestamp('last_tick_at', { withTimezone: true }).notNull(),
+  lastTickBy: text('last_tick_by').notNull(),
+});
+
 export const robotsCache = pgTable('robots_cache', {
   id: id(),
   host: citext('host').notNull().unique(),

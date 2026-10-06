@@ -39,6 +39,20 @@ COPY src ./src
 USER node
 CMD ["npm", "run", "migrate"]
 
+# --- worker: the claim loop, the scheduler and the reaper (§6, §19) -----------
+#
+# Shares the tools stage's shape — it runs TypeScript directly through tsx, like
+# the migration step — so there is one runtime for the app and the worker and no
+# second build pipeline to keep in step.
+FROM base AS worker
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json tsconfig.json ./
+COPY migrations ./migrations
+COPY src ./src
+USER node
+CMD ["npx", "tsx", "src/worker/index.ts"]
+
 # --- web ----------------------------------------------------------------------
 FROM base AS web
 ENV NODE_ENV=production
