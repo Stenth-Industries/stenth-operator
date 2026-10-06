@@ -9,7 +9,7 @@
  * scrubber over both the message and the merged object, not as a convention
  * that every call site has to remember.
  */
-import { pino, type Logger } from 'pino';
+import { pino, type DestinationStream, type LogFn, type Logger } from 'pino';
 
 import { getConfig } from '../config';
 import { newTraceId } from './trace';
@@ -151,38 +151,61 @@ export function scrubValue(input: unknown, depth = 0, seen = new WeakSet<object>
  */
 export const processTraceId = newTraceId();
 
-function build(): Logger {
+/**
+ * The base instance carries no trace id.
+ *
+ * pino serialises base bindings and child bindings as separate chunks, so a
+ * trace_id in base plus a trace_id on a child emits the key twice on one line.
+ * JSON.parse hides that by keeping the last value, but grep by trace id — the
+ * whole observability story in §16 — then matches lines belonging to another
+ * trace. Every trace_id therefore comes from exactly one child of this base.
+ */
+function buildBase(destination?: DestinationStream): Logger {
   const config = getConfig();
-  return pino({
+  const options = {
     level: config.LOG_LEVEL,
     base: {
       service: config.SERVICE_NAME,
-      trace_id: processTraceId,
     },
     formatters: {
-      level: (label) => ({ level: label }),
-      log: (object) => scrubValue(object) as Record<string, unknown>,
+      level: (label: string) => ({ level: label }),
+      log: (object: Record<string, unknown>) =>
+        scrubValue(object) as Record<string, unknown>,
     },
     hooks: {
-      logMethod(args, method) {
+      logMethod(this: Logger, args: unknown[], method: LogFn) {
         const scrubbed = args.map((arg) =>
           typeof arg === 'string' ? scrubString(arg) : arg,
         );
-        return method.apply(this, scrubbed as Parameters<typeof method>);
+        return method.apply(this, scrubbed as Parameters<LogFn>);
       },
     },
-  });
+  };
+
+  return destination === undefined ? pino(options) : pino(options, destination);
 }
 
-let root: Logger | undefined;
+let base: Logger | undefined;
+let processLogger: Logger | undefined;
 
-/** The root logger. JSON to stdout. */
+/**
+ * The root logger. JSON to stdout, with the process trace id, which keeps the
+ * §16 guarantee — trace_id on every line — true for boot and shutdown lines
+ * that belong to no pipeline run.
+ */
 export function getLogger(): Logger {
-  root ??= build();
-  return root;
+  base ??= buildBase();
+  processLogger ??= base.child({ trace_id: processTraceId });
+  return processLogger;
 }
 
-/** A child logger bound to a trace id (§16). */
+/** A child logger bound to a trace id (§16). Exactly one trace_id per line. */
 export function withTrace(traceId: string): Logger {
-  return getLogger().child({ trace_id: traceId });
+  base ??= buildBase();
+  return base.child({ trace_id: traceId });
+}
+
+/** For tests: a logger writing to a caller-supplied stream. */
+export function createTestLogger(destination: DestinationStream): Logger {
+  return buildBase(destination);
 }

@@ -1,0 +1,90 @@
+# CI for STENTH Operator (SPEC.md §25 Day 1).
+#
+# Runs on every commit. The adversarial structural
+# assertions of §23 run here too — §23 is explicit that if the build runs late,
+# they are not what gets cut.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci_postgres_pw
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # The reliability suite creates and drops its own throwaway database.
+      TEST_ADMIN_DATABASE_URL: postgresql://postgres:ci_postgres_pw@127.0.0.1:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # §19 rule 5 and §23: nothing in package.json can send mail.
+      - name: Lint — no mail capability
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Unit, plus the reliability suite against a real PostgreSQL 16:
+      # migrations idempotent on a fresh database, the five roles, the four
+      # safety constraints, the append-only audit spine and the boxed-in
+      # fetcher role.
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The image the VPS runs is the artefact; a build that only works on a
+      # developer's machine is not verified.
+      - name: Build images
+        run: docker compose --profile migrate build
+
+  # A migration is never edited once applied (§19 rule 3). On a pull request,
+  # that is checkable: a migration already on the default branch must not have
+  # changed in the diff.
+  migrations-are-forward-only:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check no applied migration was modified
+        run: |
+          base="origin/${{ github.base_ref }}"
+          changed=$(git diff --name-only --diff-filter=MDR "$base"...HEAD -- migrations || true)
+          if [ -n "$changed" ]; then
+            echo "::error::These migrations were modified or removed. Migrations are forward-only and are never edited once applied (SPEC.md §19 rule 3). Add a new migration instead."
+            echo "$changed"
+            exit 1
+          fi
+          echo "No applied migration was modified."

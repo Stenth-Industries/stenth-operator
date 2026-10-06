@@ -74,3 +74,48 @@ describe('log redaction (SPEC.md §17)', () => {
     expect(scrubbed.type).toBe('Error');
   });
 });
+
+describe('trace_id appears exactly once per line (SPEC.md §16)', () => {
+  function capture(): { lines: string[]; stream: { write(chunk: string): void } } {
+    const lines: string[] = [];
+    return {
+      lines,
+      stream: {
+        write(chunk: string) {
+          lines.push(chunk);
+        },
+      },
+    };
+  }
+
+  it('emits one trace_id, the request’s, on a child line', async () => {
+    const { createTestLogger } = await import('../../src/obs/log');
+    const sink = capture();
+    const base = createTestLogger(sink.stream);
+    base.level = 'info';
+
+    base.child({ trace_id: '01JA2BCDEFGHJKMNPQRSTVWXYZ' }).info({ queue_depth: 0 }, 'health ok');
+
+    const line = sink.lines[0] ?? '';
+    // JSON.parse would hide a duplicate by keeping the last value, so the
+    // assertion is on the raw line: grep by trace id has to be unambiguous.
+    expect(line.match(/"trace_id"/g)).toHaveLength(1);
+    expect(line).toContain('"trace_id":"01JA2BCDEFGHJKMNPQRSTVWXYZ"');
+    expect(line).toContain('"service":"test"');
+  });
+
+  it('still scrubs secrets when writing through a child', async () => {
+    const { createTestLogger } = await import('../../src/obs/log');
+    const sink = capture();
+    const base = createTestLogger(sink.stream);
+    base.level = 'info';
+
+    base
+      .child({ trace_id: '01JA2BCDEFGHJKMNPQRSTVWXYZ' })
+      .info({ DATABASE_URL: 'postgresql://u:p@h/db' }, 'connected with Bearer abc123TOKENvalue');
+
+    const line = sink.lines[0] ?? '';
+    expect(line).toContain(REDACTED);
+    expect(line).not.toContain('postgresql://u:p@h/db');
+  });
+});

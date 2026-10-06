@@ -50,6 +50,23 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
   let pool: Pool;
   let targetUrl: string;
 
+  /**
+   * Every pool the suite opens, so teardown can close all of them before the
+   * database is dropped. DROP DATABASE WITH (FORCE) terminates whatever is
+   * still connected, which reaches an idle client as an unhandled 57P01; the
+   * error handler keeps a connection the server closed from failing the run.
+   */
+  const pools: Pool[] = [];
+
+  function trackPool(connectionString: string): Pool {
+    const created = new Pool({ connectionString });
+    created.on('error', () => {
+      // A connection terminated by the server during teardown is expected.
+    });
+    pools.push(created);
+    return created;
+  }
+
   beforeAll(async () => {
     for (const [key, value] of Object.entries(PASSWORDS)) {
       process.env[key] = value;
@@ -61,7 +78,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
 
     base.pathname = `/${dbName}`;
     targetUrl = base.toString();
-    pool = new Pool({ connectionString: targetUrl });
+    pool = trackPool(targetUrl);
 
     const client = await pool.connect();
     try {
@@ -72,7 +89,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
   });
 
   afterAll(async () => {
-    await pool?.end();
+    // Close every connection first, then drop. The other order makes the drop
+    // race pools that are still ending.
+    await Promise.allSettled(pools.map((open) => open.end()));
     if (maintenancePool !== undefined) {
       await maintenancePool.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
       await maintenancePool.end();
@@ -410,11 +429,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       const url = new URL(targetUrl);
       url.username = 'operator_fetch';
       url.password = PASSWORDS.OPERATOR_FETCH_PASSWORD as string;
-      fetcherPool = new Pool({ connectionString: url.toString() });
-    });
-
-    afterAll(async () => {
-      await fetcherPool?.end();
+      fetcherPool = trackPool(url.toString());
     });
 
     it.each(['contacts', 'outreach_drafts', 'approved_outreach', 'events'])(
@@ -451,7 +466,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
     const appUrl = new URL(targetUrl);
     appUrl.username = 'operator_app';
     appUrl.password = PASSWORDS.OPERATOR_APP_PASSWORD as string;
-    const appPool = new Pool({ connectionString: appUrl.toString() });
+    const appPool = trackPool(appUrl.toString());
 
     try {
       const report = await collectHealth(appPool);
@@ -467,6 +482,58 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       expect(report.spend?.state).toBe('ok');
     } finally {
       await appPool.end();
+    }
+  });
+
+  it('reports a warning state once spend crosses $35 (§2, §16)', async () => {
+    const appUrl = new URL(targetUrl);
+    appUrl.username = 'operator_app';
+    appUrl.password = PASSWORDS.OPERATOR_APP_PASSWORD as string;
+    const appPool = trackPool(appUrl.toString());
+
+    try {
+      // The budgets row is the operational source of truth, so the ceiling is a
+      // data change and not a deploy (§16).
+      await appPool.query(
+        `INSERT INTO budgets (period_month, limit_usd, warn_usd, hard_stop_usd)
+         VALUES (date_trunc('month', now())::date, 50, 35, 50)
+         ON CONFLICT (period_month) DO NOTHING`,
+      );
+      await appPool.query(
+        `INSERT INTO llm_calls (trace_id, purpose, isolation, provider, model, status, cost_usd)
+         VALUES ('01JA2BCDEFGHJKMNPQRSTVWXYZ', 'company.assess', 'privileged',
+                 'test', 'test-model', 'succeeded', 36.00)`,
+      );
+
+      const report = await collectHealth(appPool);
+      expect(report.spend?.month_to_date_usd).toBe(36);
+      expect(report.spend?.state).toBe('warn');
+
+      // And the hard stop, which blocks rather than warns.
+      await appPool.query(
+        `INSERT INTO llm_calls (trace_id, purpose, isolation, provider, model, status, cost_usd)
+         VALUES ('01JA2BCDEFGHJKMNPQRSTVWXYZ', 'company.assess', 'privileged',
+                 'test', 'test-model', 'succeeded', 20.00)`,
+      );
+      const stopped = await collectHealth(appPool);
+      expect(stopped.spend?.state).toBe('stopped');
+    } finally {
+      await appPool.end();
+    }
+  });
+
+  it('refuses a budget whose warning sits above its limit (§16)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('SET ROLE operator_app');
+      await expect(
+        client.query(
+          `INSERT INTO budgets (period_month, limit_usd, warn_usd, hard_stop_usd)
+           VALUES ('2030-01-01', 50, 60, 50)`,
+        ),
+      ).rejects.toThrow(/budgets_warn_at_or_below_limit/);
+    } finally {
+      client.release();
     }
   });
 });

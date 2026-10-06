@@ -1,13 +1,29 @@
 # STENTH Operator V1.1 — local and single-VPS stack (SPEC.md §20).
 #
 # Day 1 brings up postgres, the migration step and web. worker arrives on Day 2,
-# fetcher on Day 3, and the public/private caddy split on Day 9; each is added
-# to this file on its own day rather than sitting here as a stub.
+# fetcher on Day 3, and the serving split on Day 9; each is added to this file on
+# its own day rather than sitting here as a stub.
 #
 # Topology per §20: postgres publishes no host port at all. web publishes only
 # on the loopback interface so it can be reached during development; on the VPS,
-# docker-compose.prod.yml removes that and Caddy becomes the only container with
-# published ports.
+# docker-compose.prod.yml removes that.
+#
+# THE TARGET VPS IS SHARED. stenth-engine also runs the /opt/stenth stack —
+# caddy, n8n, and an n8n-clients instance that is production for a paying
+# client. Nothing under /opt/stenth is ours to modify, restart or redeploy.
+# Three consequences are baked into this file:
+#
+#   1. Its own Compose project name, so `docker compose down` here can never
+#      reach the other stack's containers.
+#   2. Its own bridge network, project-scoped by that name.
+#   3. A mem_limit on every container. The box has ~2.7 GB free of 4 GB, and an
+#      Operator container that balloons must hit its own ceiling rather than
+#      starve the client's n8n. The limits below total 1.65 GB and leave the
+#      existing stack its headroom.
+#
+# Ports 80 and 443 are already published by the existing Caddy, so Operator
+# cannot bind them as §20 describes. That is an open deviation awaiting a
+# decision — see ops/deviations.md. Nothing here publishes either port.
 
 name: stenth-operator
 
@@ -21,6 +37,17 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       # Backups run nightly at 02:30 Australia/Sydney (§18).
       TZ: Australia/Sydney
+    # Sized to the mem_limit below rather than to the host, which is shared.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=50
+    mem_limit: 1g
+    memswap_limit: 1g
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -38,6 +65,8 @@ services:
     build:
       context: .
       target: tools
+      secrets:
+        - npm_ca
     profiles: ["migrate"]
     environment:
       NODE_ENV: production
@@ -50,6 +79,8 @@ services:
       OPERATOR_SCHED_PASSWORD: ${OPERATOR_SCHED_PASSWORD}
       OPERATOR_MIGRATE_PASSWORD: ${OPERATOR_MIGRATE_PASSWORD}
       OPERATOR_RO_PASSWORD: ${OPERATOR_RO_PASSWORD}
+    mem_limit: 256m
+    memswap_limit: 256m
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,6 +92,8 @@ services:
     build:
       context: .
       target: web
+      secrets:
+        - npm_ca
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -71,6 +104,11 @@ services:
       AI_BUDGET_MONTHLY_USD: ${AI_BUDGET_MONTHLY_USD:-50}
       AI_BUDGET_WARN_USD: ${AI_BUDGET_WARN_USD:-35}
       AI_BUDGET_HARD_STOP_USD: ${AI_BUDGET_HARD_STOP_USD:-50}
+      # Node's own ceiling, under the container limit, so an OOM is a clean
+      # heap error in the logs rather than a kill the host has to explain.
+      NODE_OPTIONS: --max-old-space-size=384
+    mem_limit: 512m
+    memswap_limit: 512m
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,7 +126,16 @@ services:
       retries: 6
       start_period: 20s
 
+# Optional, and only consumed at build time: see the Dockerfile's deps stage.
+# NPM_CA_FILE points at a TLS-inspecting proxy's CA bundle on networks that need
+# one. Unset, it resolves to an empty file and the build behaves normally.
+secrets:
+  npm_ca:
+    file: ${NPM_CA_FILE:-/dev/null}
+
 networks:
+  # Project-scoped: docker names it stenth-operator_internal, which cannot
+  # collide with the existing stack's network.
   internal:
     driver: bridge
 

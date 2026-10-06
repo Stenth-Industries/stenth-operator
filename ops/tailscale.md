@@ -13,15 +13,28 @@ Nothing in this file can be run from CI or from a development container. It
 needs the VPS, a Tailscale auth key, and someone who can open the provider's
 serial console if it goes wrong.
 
+**Current state (Oct 6, 2026).** Tailscale is installed on neither the server
+nor the operator's PC. SSH is still on public port 22, with ufw allowing
+22/80/443, fail2ban on, and key-only authentication. So none of the steps below
+have been taken yet, and §20's "dashboard reachable over Tailscale only" is not
+yet true of this host.
+
+**This box is shared.** `/opt/stenth` runs the existing Caddy and two n8n
+instances, one of them production for a paying client. Every command here is
+host-level and therefore affects them too — which is exactly why the ufw step
+is the one to be careful with. Nothing below touches `/opt/stenth`.
+
 ## 0. Before you touch SSH
 
 Write these two things down somewhere that is not the box:
 
-- The provider's console or rescue-mode path for this VPS, **tested once** —
-  open it, confirm you get a prompt. An untested recovery path is not one.
-- A second administrator who can reach the console if you cannot.
+- The **Vultr console** path for stenth-engine (Products → the instance → View
+  Console), **tested once** — open it, confirm you get a login prompt. An
+  untested recovery path is not one.
+- A second administrator who can reach that console if you cannot.
 
-Do not continue until both are true.
+Do not continue until both are true. Locking yourself out of this box takes the
+paying client's n8n down with it.
 
 ## 1. Install Tailscale
 
@@ -60,11 +73,12 @@ recoverable without the console:
 
 ```sh
 sudo ufw allow in on tailscale0 to any port 22 proto tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw --force enable
 sudo ufw status verbose
 ```
+
+80 and 443 are already allowed on this host and are serving the existing stack.
+Do not re-run `ufw --force enable` or re-add those rules speculatively; check
+`ufw status verbose` first and change only the rule for 22.
 
 Then, and only then, close public SSH:
 
@@ -82,6 +96,8 @@ fail2ban on SSH, unattended security upgrades. The public surface stays 80 and
 
 ## What is still outstanding after this file
 
-Day 9 owns the Caddy public/private split, so until then the dashboard is
-private only because of ufw and Tailscale, not because of a 404 from a public
-site block. That is the Day 9 exit criterion, not this one.
+Day 9 owns the serving split, so until then the dashboard is private only
+because of ufw and Tailscale, not because of a 404 from a public site block.
+That is the Day 9 exit criterion, not this one — and on this host the split
+itself is an open question, because ports 80 and 443 already belong to the
+existing Caddy. See ops/deviations.md.

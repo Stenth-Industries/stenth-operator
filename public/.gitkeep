@@ -1,0 +1,3 @@
+Next.js serves static files from this directory. Kept in git so a fresh clone
+has it: the Dockerfile copies public/ into the runtime image, and an empty
+directory that git does not track would break that build.
