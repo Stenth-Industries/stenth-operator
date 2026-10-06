@@ -50,6 +50,27 @@ curl -fsS http://<tailscale-ip>:3000/api/health | jq .
 successful job, the age of the last scheduler tick, and month-to-date spend
 against the $50 ceiling (§2, §16, §20).
 
+## If the app cannot authenticate to Postgres after a deploy
+
+`password authentication failed for user "operator_app"` almost always means the
+database volume predates the `.env` it is being given. `POSTGRES_PASSWORD` is
+read by the postgres image **only when it initialises an empty data directory**,
+so rotating passwords in `.env` does not change the ones already in the
+database. The roles that Operator uses are a separate matter — the migration
+step resets those on every run — but the `postgres` superuser password in
+`ADMIN_DATABASE_URL` is not.
+
+Rotating the superuser password therefore means changing it in the database, not
+just in the file:
+
+```sh
+docker compose exec postgres psql -U postgres -c "ALTER ROLE postgres PASSWORD '<new value from .env>';"
+```
+
+Never reach for `docker compose down -v` on the VPS to resolve this. That
+deletes the volume and every prospect, assessment and approval in it. It is the
+right move only on a throwaway local stack.
+
 ## The database roles
 
 The migration step creates the five roles of §17 and sets their passwords from
