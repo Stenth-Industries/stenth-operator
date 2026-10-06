@@ -68,10 +68,131 @@ Rerunning it when the tree is already at `TARGET` is a no-op that still verifies
 the SHA. If it aborts on the branch check, the tree is probably on a detached
 HEAD from an earlier rollback: `git checkout main`, then rerun.
 
-## 2-4. Build, migrate, start
+## 2. Verify the shell and the file modes before building
+
+A release once reached production with its source copied in at mode 600. The
+cause was an earlier `umask 077`, left set in the interactive shell after
+creating `.env`, so every file `git pull` then wrote was 600 and every directory
+700.
+
+That breaks the build in a way nothing reports at build time, because the Docker
+daemon reads the build context as root. Host modes are carried into the image,
+and `migrate` and `worker` both run as the non-root `node` user:
+
+| On the host | Inside the image | Result as `node` |
+|---|---|---|
+| `src/db/migrate.ts` 600 | 600, owned by root | `Permission denied` |
+| `src/db/` 700 (nested) | 700 | cannot traverse or list |
+| `src/` 755 (the COPY target) | 755 — the destination is normalised | fine |
+
+Only the destination directory gets normalised. Everything nested inside keeps
+what the host gave it, which is exactly where `src/db`, `src/jobs`, `src/worker`
+and `migrations` live.
+
+Run this before every build. It aborts rather than letting a broken image get
+built:
 
 ```sh
-docker compose build
+cd /opt/stenth-operator
+
+( set -eu
+  FAIL=0
+
+  CUR="$(umask)"
+  case "$CUR" in
+    0022|022|0002|002) echo "   umask            $CUR" ;;
+    *) echo "   umask            $CUR   <-- not a normal umask"; FAIL=1 ;;
+  esac
+
+  if [ -f .env ]; then
+    MODE="$(stat -c '%a' .env)"
+    if [ "$MODE" = "600" ]; then echo "   .env             600"
+    else echo "   .env             $MODE   <-- must stay 600"; FAIL=1; fi
+  else
+    echo "   .env             MISSING"; FAIL=1
+  fi
+
+  # Files keep their host mode inside the image, and migrate and worker run as
+  # the non-root 'node' user. The last octal digit must carry read.
+  BAD_FILES="$(git ls-files -z | xargs -0 stat -c '%a %n' \
+    | awk '{ last = substr($1, length($1)); if (last !~ /^[4-7]$/) print substr($0, index($0, " ") + 1) }')"
+  if [ -z "$BAD_FILES" ]; then echo "   tracked files    all readable"
+  else
+    echo "   tracked files    NOT readable by a non-root user:"
+    echo "$BAD_FILES" | sed 's/^/                      /'; FAIL=1
+  fi
+
+  # Nested directories keep their host mode too, so they must be traversable
+  # and listable: last octal digit 5 or 7.
+  BAD_DIRS="$(git ls-files -z | xargs -0 -n1 dirname | sort -u | xargs stat -c '%a %n' \
+    | awk '{ last = substr($1, length($1)); if (last !~ /^[57]$/) print substr($0, index($0, " ") + 1) }')"
+  if [ -z "$BAD_DIRS" ]; then echo "   tracked dirs     all traversable"
+  else
+    echo "   tracked dirs     NOT traversable by a non-root user:"
+    echo "$BAD_DIRS" | sed 's/^/                      /'; FAIL=1
+  fi
+
+  [ "$FAIL" -eq 0 ] || { echo "   ABORT: fix the above before building"; exit 1; }
+  echo "   OK: safe to build"
+)
+```
+
+If it reports bad modes, repair them and rerun it. `git ls-files` is the
+selector, which is what keeps `.env` out of reach — it is untracked, so this
+cannot weaken it:
+
+```sh
+( set -eu
+  chmod o+rx,g+rx .
+  git ls-files -z | xargs -0 -n1 dirname | sort -u | xargs chmod o+rx,g+rx
+  git ls-files -z | xargs -0 chmod o+r,g+r
+  echo "   repaired tracked file and directory modes; .env untouched"
+)
+```
+
+If the umask itself is wrong, restore it in the shell you are deploying from —
+`umask 022` — and then repair the modes, because the files are already written.
+
+**Never leave a deploy shell at `umask 077`.** Every block in this runbook that
+needs a tight umask sets it inside a subshell, `( umask 077; ... )`, so it
+cannot escape into the session. If you ever need it at the prompt, restore it in
+the same breath:
+
+```sh
+OLD_UMASK="$(umask)"; umask 077; : do the thing; umask "$OLD_UMASK"
+```
+
+## 3. Build — including the profile-gated migrate image
+
+```sh
+docker compose --profile migrate build
+```
+
+**Not plain `docker compose build`.** `migrate` sits behind a Compose profile so
+it never starts with `up`, and a profile that is not enabled is not built
+either. Plain `docker compose build` exits 0, reports success, and silently
+builds only `web` and `worker` — measured on this stack:
+
+```text
+$ docker compose build
+Image stenth-operator-web     Built
+Image stenth-operator-worker  Built
+# migrate image: absent
+```
+
+`docker compose run` does not save you. It builds the image when it is
+**missing**, but never because the source moved: with a previous release's
+migrate image already present, `run` reuses it — same image id, no "Building"
+line, no warning. That is how a release once ran the *previous* version's
+migration step. `docker compose --profile migrate build` makes it a non-event;
+`docker compose build migrate web worker` works too, by naming every service.
+
+This matters most for exactly the releases where it is most dangerous: any
+release that adds or changes a migration.
+
+## 4-5. Migrate, then start
+
+```sh
 docker compose run --rm migrate
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
@@ -96,7 +217,9 @@ that balloons hits its own ceiling instead of starving the client's n8n.
 A cold image build needs about another 850 MiB (measured, not estimated), so
 **build with the stack down, or at least with web and worker stopped** — on a
 redeploy, 1.875 GiB resident plus a build does not leave comfortable headroom.
-Check before and after:
+
+The build command is `docker compose --profile migrate build`, for the reason in
+step 3 above. Check the headroom before and after:
 
 ```sh
 free -m
@@ -136,8 +259,10 @@ free -m
 git -c advice.detachedHead=false checkout <previous release SHA>
 git --no-pager log --oneline -1
 
-# 4. Rebuild and start what that revision defines.
-docker compose build
+# 4. Rebuild and start what that revision defines. The profile flag keeps the
+#    migrate image in step with the reverted source, and is harmless on a
+#    revision that has no such service.
+docker compose --profile migrate build
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 # 5. Verify.
