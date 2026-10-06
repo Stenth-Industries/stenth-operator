@@ -485,3 +485,87 @@ describeWithDb('robots.txt acquisition failures are not permission (§8, §15)',
     expect(result.reason).toBe('port_not_allowed');
   }, 60_000);
 });
+
+describeWithDb('a job cannot introduce credentials through the URL (addendum item 1)', () => {
+  let db3: TestDatabase;
+  let companyId3: string;
+
+  beforeAll(async () => {
+    db3 = await createTestDatabase();
+    const { rows } = await db3.adminPool.query<{ id: string }>(
+      `INSERT INTO companies (canonical_domain) VALUES ('creds-legal.com.au') RETURNING id`,
+    );
+    companyId3 = rows[0]!.id;
+  }, 120_000);
+
+  afterAll(async () => {
+    await db3?.close();
+  });
+
+  it.each([
+    'http://user:pass@example.com/',
+    'https://user@example.com/',
+  ])('refuses %s before any network request, and stores nothing', async (url) => {
+    const result = await fetchAndStore(
+      {
+        pool: db3.poolAs('operator_fetch'),
+        sharedSecret: SECRET,
+        policy: FROZEN_POLICY,
+        politeness: new HostPoliteness({ minIntervalMs: 0 }),
+      },
+      { companyId: companyId3, url, traceId: '01JA2BCDEFGHJKMNPQRSTVWXYZ' },
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.reason).toBe('url_has_credentials');
+    expect(result.snapshot_id).toBeUndefined();
+
+    // Nothing persisted at all — so no credential reaches web_snapshots.url,
+    // which §17 would forbid, and no robots row is written for a host we never
+    // contacted.
+    const snapshots = await db3.adminPool.query<{ count: string }>(
+      'SELECT count(*) AS count FROM web_snapshots WHERE company_id = $1',
+      [companyId3],
+    );
+    expect(snapshots.rows[0]?.count).toBe('0');
+    const robots = await db3.adminPool.query<{ count: string }>(
+      'SELECT count(*) AS count FROM robots_cache',
+    );
+    expect(robots.rows[0]?.count).toBe('0');
+  }, 60_000);
+
+  it('refuses a redirect whose target carries credentials', async () => {
+    const server = createServer((request, response) => {
+      if (request.url === '/robots.txt') {
+        response.writeHead(404, { 'content-type': 'text/plain' });
+        response.end('none');
+      } else {
+        response.writeHead(302, { location: 'http://user:pass@example.com/' });
+        response.end();
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      const result = await fetchAndStore(
+        {
+          pool: db3.poolAs('operator_fetch'),
+          sharedSecret: SECRET,
+          policy: {
+            ...FROZEN_POLICY,
+            permitLoopback: true,
+            allowedPorts: [...FROZEN_POLICY.allowedPorts, port],
+            minHostIntervalMs: 0,
+          },
+          politeness: new HostPoliteness({ minIntervalMs: 0 }),
+        },
+        { companyId: companyId3, url: `http://127.0.0.1:${port}/start`, traceId: '01JA2BCDEFGHJKMNPQRSTVWXYZ' },
+      );
+      expect(result.outcome).toBe('refused');
+      expect(result.reason).toBe('url_has_credentials');
+    } finally {
+      server.close();
+    }
+  }, 60_000);
+});

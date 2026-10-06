@@ -40,6 +40,7 @@ export const ROLES = [
 ] as const;
 
 const MIGRATION_ROLE = 'operator_migrate';
+const SCHEDULER_ROLE = 'operator_sched';
 
 const SAFE_IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 
@@ -102,6 +103,87 @@ export function loadMigrations(dir: string = MIGRATIONS_DIR): Migration[] {
  * Idempotent: every statement tolerates having been run before, because this
  * runs on every deploy and not only on a fresh database.
  */
+/** Matches every pg_advisory_* and pg_try_advisory_* overload. */
+const ADVISORY_FUNCTIONS = `
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'pg_catalog' AND p.proname ~ '^pg_(try_)?advisory_'`;
+
+/**
+ * Hands the advisory-lock namespace to the scheduler alone (§8, §17).
+ *
+ * The scheduler is a singleton by advisory lock: tick() runs only if
+ * pg_try_advisory_lock(<scheduler key>) succeeds. PostgreSQL grants EXECUTE on
+ * those functions to PUBLIC, so by default every role in the database can take
+ * any key — including operator_fetch, the role of the one process §8 assumes
+ * can be compromised. One statement from a compromised fetcher (the blocking
+ * pg_advisory_lock on the scheduler's key, held open on an idle session) stops
+ * every tick for as long as that session lives. Nothing is denied, nothing
+ * errors, and no job is ever enqueued again: the pipeline stalls in silence.
+ *
+ * That is not an escalation of what the fetcher can read, which is why a
+ * table-privilege audit does not show it, but it is the scheduler's own
+ * mechanism handed to the least trusted role. The fetcher needs no advisory
+ * lock: its politeness is in-process and its snapshot writes are serialised by
+ * a unique constraint.
+ *
+ * This lives in bootstrap, beside the other REVOKE ... FROM PUBLIC, rather than
+ * in a migration, because apply() runs migrations as operator_migrate and
+ * PostgreSQL treats a REVOKE by a non-owner as a no-op with a warning — a
+ * security migration that reports success and changes nothing. Function ACLs
+ * are per-database, so nothing outside the Operator database is touched.
+ */
+async function restrictAdvisoryLocks(client: PoolClient): Promise<void> {
+  const log = getLogger();
+
+  await client.query(`
+    DO $$
+    DECLARE
+      target text;
+    BEGIN
+      FOR target IN
+        SELECT format(
+          '%I.%I(%s)', n.nspname, p.proname,
+          pg_get_function_identity_arguments(p.oid)
+        )
+        ${ADVISORY_FUNCTIONS}
+      LOOP
+        -- Every overload and variant: the blocking, _shared and _xact forms all
+        -- reach the same lock namespace, so leaving one public leaves the hole.
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', target);
+        EXECUTE format(
+          'GRANT EXECUTE ON FUNCTION %s TO ${SCHEDULER_ROLE}', target
+        );
+      END LOOP;
+    END
+    $$`);
+
+  // Verified, not assumed: a REVOKE by a role that does not own pg_catalog is
+  // that same silent no-op, so the control is confirmed against the catalog.
+  const leaked = await client.query<{ name: string }>(`
+    SELECT format('%I(%s)', p.proname, pg_get_function_identity_arguments(p.oid))
+             AS name
+    ${ADVISORY_FUNCTIONS}
+      AND has_function_privilege('public', p.oid, 'EXECUTE')
+    ORDER BY name`);
+
+  if (leaked.rowCount !== 0) {
+    throw new Error(
+      'The advisory-lock namespace is still executable by PUBLIC, so any ' +
+        'role — including operator_fetch — can hold the scheduler key and ' +
+        'stall every tick (SPEC.md §8, §17). PostgreSQL ignores a REVOKE from ' +
+        'a role that does not own pg_catalog, so ADMIN_DATABASE_URL must be ' +
+        'the bootstrap superuser. Still public: ' +
+        leaked.rows.map((row) => row.name).join(', '),
+    );
+  }
+
+  log.info(
+    { role: SCHEDULER_ROLE, functions: 'pg_advisory_*' },
+    'advisory-lock namespace restricted to the scheduler role',
+  );
+}
+
 export async function bootstrap(client: PoolClient): Promise<void> {
   const log = getLogger();
 
@@ -155,6 +237,8 @@ export async function bootstrap(client: PoolClient): Promise<void> {
       await client.query(`GRANT USAGE ON SCHEMA public TO ${role.name}`);
     }
   }
+
+  await restrictAdvisoryLocks(client);
 
   // SET ROLE needs membership. A superuser admin already has it; a non-superuser
   // admin with CREATEROLE granted the role above and so can grant it onward.
@@ -210,6 +294,10 @@ export async function apply(
     );
     recorded = new Map(rows.map((row) => [row.version, row]));
   } finally {
+    // SET ROLE outlives the statement, not the connection: a pooled client
+    // released while still wearing operator_migrate hands that role to whoever
+    // borrows it next, which is both a privilege surprise and a silent one.
+    await setup.query('RESET ROLE').catch(() => undefined);
     setup.release();
   }
 
@@ -244,6 +332,7 @@ export async function apply(
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
+      await client.query('RESET ROLE').catch(() => undefined);
       client.release();
     }
   }

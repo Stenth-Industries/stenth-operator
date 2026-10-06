@@ -432,10 +432,21 @@ The migration step creates the five roles of §17 and sets their passwords from
 `.env`. It needs `ADMIN_DATABASE_URL`; the web and worker containers do not have
 it, and must not.
 
+`ADMIN_DATABASE_URL` must be the bootstrap superuser (`postgres`), not merely a
+role with `CREATEROLE`. Beyond creating the roles, the step takes the
+`pg_advisory_*` functions away from `PUBLIC` and grants them to
+`operator_sched` alone, so that a compromised fetcher cannot hold the
+scheduler's lock key and stall every tick. PostgreSQL ignores a `REVOKE` issued
+by a role that does not own `pg_catalog` — quietly, with only a warning — so the
+step verifies the result and **fails the migration** rather than reporting
+success on a control that did not apply. If you see
+`The advisory-lock namespace is still executable by PUBLIC`, fix
+`ADMIN_DATABASE_URL` and re-run; nothing has been half-applied.
+
 | Role | Holds |
 |---|---|
 | `operator_app` | DML on application tables. The web app and the worker |
 | `operator_fetch` | Insert into `web_snapshots` and read back only its `id`, `company_id`, `url` and `content_hash`; maintain `robots_cache`. Nothing else — the fetcher service only, and it cannot read the page text it writes |
-| `operator_sched` | Read and update `schedules`, insert into `jobs` |
+| `operator_sched` | Read and update `schedules`, insert into `jobs`, and the advisory-lock namespace — no other role can take the scheduler's key |
 | `operator_migrate` | DDL. The migration step only; owns every table |
 | `operator_ro` | Read-only, for ad-hoc queries |

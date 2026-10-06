@@ -75,12 +75,21 @@ describe('addresses that must be refused', () => {
     ['fe80::1', 'IPv6 link-local'],
     ['fe80::1%eth0', 'IPv6 link-local with a zone index'],
     ['ff02::1', 'IPv6 multicast'],
-    // IPv4 smuggled inside IPv6
+    // IPv4 smuggled inside IPv6 — the five the acceptance addendum requires,
+    // then the same addresses spelled differently.
     ['::ffff:127.0.0.1', 'IPv4-mapped loopback'],
-    ['::ffff:10.0.0.1', 'IPv4-mapped RFC1918'],
-    ['::ffff:169.254.169.254', 'IPv4-mapped metadata'],
-    ['64:ff9b::127.0.0.1', 'NAT64-embedded loopback'],
+    ['::ffff:10.0.0.1', 'IPv4-mapped RFC1918 10/8'],
+    ['::ffff:172.16.0.1', 'IPv4-mapped RFC1918 172.16/12'],
+    ['::ffff:192.168.1.1', 'IPv4-mapped RFC1918 192.168/16'],
+    ['::ffff:169.254.169.254', 'IPv4-mapped cloud metadata'],
     ['0:0:0:0:0:ffff:7f00:1', 'IPv4-mapped loopback written in full'],
+    ['0:0:0:0:0:ffff:7f00:0001', 'IPv4-mapped loopback, zero-padded'],
+    ['::FFFF:10.0.0.1', 'IPv4-mapped, upper case'],
+    ['::ffff:ac10:1', 'IPv4-mapped 172.16.0.1 as hex groups'],
+    ['::ffff:c0a8:101', 'IPv4-mapped 192.168.1.1 as hex groups'],
+    ['::ffff:a9fe:a9fe', 'IPv4-mapped 169.254.169.254 as hex groups'],
+    ['64:ff9b::127.0.0.1', 'NAT64-embedded loopback'],
+    ['64:ff9b::192.168.1.1', 'NAT64-embedded RFC1918'],
   ];
 
   it.each(blocked)('refuses %s (%s)', (address) => {
@@ -104,6 +113,26 @@ describe('addresses that must be allowed', () => {
   it.each(allowed)('allows %s', (address) => {
     const verdict = classifyAddress(address);
     expect(verdict.allowed, `${address} should be allowed: ${verdict.reason ?? ''}`).toBe(true);
+  });
+});
+
+describe('the URL-literal forms of those addresses are refused too', () => {
+  // Node normalises http://[::ffff:127.0.0.1]/ to the hostname ::ffff:7f00:1,
+  // which is why classification works on the parsed bytes and not the string
+  // the attacker wrote.
+  it.each([
+    'http://[::ffff:127.0.0.1]/',
+    'http://[::ffff:10.0.0.1]/',
+    'http://[::ffff:172.16.0.1]/',
+    'http://[::ffff:192.168.1.1]/',
+    'http://[::ffff:169.254.169.254]/',
+    'http://[::1]/',
+    'http://[fe80::1]/',
+    'http://[fc00::1]/',
+  ])('refuses the host in %s', (url) => {
+    const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    const verdict = classifyAddress(hostname);
+    expect(verdict.allowed, `${url} (parsed as ${hostname}) was allowed`).toBe(false);
   });
 });
 

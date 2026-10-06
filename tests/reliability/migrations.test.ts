@@ -84,6 +84,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
     try {
       await bootstrap(client);
     } finally {
+      // SET ROLE lasts for the session, so a client released still wearing
+      // a role lends it to the next borrower of that connection.
+      await client.query('RESET ROLE').catch(() => undefined);
       client.release();
     }
   });
@@ -135,6 +138,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         await client.query(readFileSync(join(migrationsDir, file), 'utf8'));
       }
     } finally {
+      // SET ROLE lasts for the session, so a client released still wearing
+      // a role lends it to the next borrower of that connection.
+      await client.query('RESET ROLE').catch(() => undefined);
       client.release();
     }
   });
@@ -219,6 +225,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       );
       expect(onConflict.rowCount).toBe(0);
     } finally {
+      // SET ROLE lasts for the session, so a client released still wearing
+      // a role lends it to the next borrower of that connection.
+      await client.query('RESET ROLE').catch(() => undefined);
       client.release();
     }
   });
@@ -242,6 +251,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
           client.query('DELETE FROM events WHERE id = $1', [id]),
         ).rejects.toThrow(/append-only/);
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -258,6 +270,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
           ),
         ).rejects.toThrow(/events_payload_carries_no_personal_text/);
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -338,6 +353,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         await client.query('ROLLBACK').catch(() => undefined);
         throw error;
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -361,6 +379,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         ).rejects.toThrow(/duplicate key/);
         expect(rows).toHaveLength(1);
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -380,6 +401,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         );
         expect(rows[0]?.handoff_state).toBe('marked_sent');
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -400,6 +424,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
           ]),
         ).rejects.toThrow(/write-once/);
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -418,6 +445,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         );
         expect(rows[0]?.to_email).toBeNull();
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
@@ -434,9 +464,40 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
           ),
         ).rejects.toThrow(/email_source_snapshot_id/);
       } finally {
+        // SET ROLE lasts for the session, so a client released still wearing
+        // a role lends it to the next borrower of that connection.
+        await client.query('RESET ROLE').catch(() => undefined);
         client.release();
       }
     });
+  });
+
+  it('hands pooled connections back without a lingering SET ROLE (§17)', async () => {
+    // apply() runs each migration as operator_migrate, and SET ROLE outlives
+    // the statement — it lasts for the session. A client released without
+    // RESET ROLE lends operator_migrate to whoever borrows that connection
+    // next, so the admin pool silently stops being the admin pool. It surfaced
+    // as the scheduler's advisory lock being denied to a superuser connection,
+    // which is the kind of clue that costs an afternoon.
+    //
+    // Every connection in the pool is checked, not one: the tainted client is
+    // whichever the migration happened to borrow.
+    const clients = await Promise.all(
+      Array.from({ length: 10 }, () => pool.connect()),
+    );
+    try {
+      for (const client of clients) {
+        const { rows } = await client.query<{ now_role: string; login_role: string }>(
+          'SELECT current_user AS now_role, session_user AS login_role',
+        );
+        expect(rows[0]?.now_role).toBe(rows[0]?.login_role);
+        expect(rows[0]?.now_role).not.toBe('operator_migrate');
+      }
+    } finally {
+      for (const client of clients) {
+        client.release();
+      }
+    }
   });
 
   describe('the fetcher is boxed in (§8, §17, §23)', () => {
@@ -550,6 +611,9 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         ),
       ).rejects.toThrow(/budgets_warn_at_or_below_limit/);
     } finally {
+      // SET ROLE lasts for the session, so a client released still wearing
+      // a role lends it to the next borrower of that connection.
+      await client.query('RESET ROLE').catch(() => undefined);
       client.release();
     }
   });

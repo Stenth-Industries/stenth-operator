@@ -1,8 +1,9 @@
-import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
+
+import { composeServices, resolveCompose } from '../helpers/compose';
 
 const root = join(__dirname, '..', '..');
 const dockerfile = readFileSync(join(root, 'Dockerfile'), 'utf8');
@@ -102,44 +103,23 @@ describe('GATE 19: the fetcher publishes no host port (§8, §20)', () => {
 
   it('is proven by the resolved configuration, not just the file', () => {
     // docker compose config is the authority: it is what the daemon acts on.
-    const env = [
-      'POSTGRES_PASSWORD=d',
-      'DATABASE_URL=postgresql://operator_app:d@postgres:5432/operator',
-      'ADMIN_DATABASE_URL=postgresql://postgres:d@postgres:5432/operator',
-      'SCHED_DATABASE_URL=postgresql://operator_sched:d@postgres:5432/operator',
-      'FETCH_DATABASE_URL=postgresql://operator_fetch:d@postgres:5432/operator',
-      `FETCHER_SHARED_SECRET=${'s'.repeat(48)}`,
-      'OPERATOR_APP_PASSWORD=d',
-      'OPERATOR_FETCH_PASSWORD=d',
-      'OPERATOR_SCHED_PASSWORD=d',
-      'OPERATOR_MIGRATE_PASSWORD=d',
-      'OPERATOR_RO_PASSWORD=d',
-      '',
-    ].join('\n');
-
-    let resolved: string;
-    try {
-      resolved = execFileSync(
-        'docker',
-        ['compose', '--env-file', '/dev/stdin', '--profile', 'migrate', 'config'],
-        { cwd: root, input: env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
-      );
-    } catch {
-      // No docker in this environment: the file-level assertion above still
-      // holds, and CI runs this with a daemon available.
+    const resolved = resolveCompose(['docker-compose.yml']);
+    if (resolved === undefined) {
+      // No Docker daemon in this environment: the file-level assertion above
+      // still holds, and CI runs this with one.
       return;
     }
 
-    const services = resolved.split(/^  (?=\S+:)/m);
-    const fetcher = services.find((block) => block.startsWith('fetcher:'));
+    const byName = composeServices(resolved);
+    const fetcher = byName.get('fetcher');
     expect(fetcher, 'no fetcher service in the resolved config').toBeDefined();
     expect(fetcher).not.toContain('published:');
 
-    // And only web publishes anything at all, on loopback.
-    const publishing = services.filter((block) => block.includes('published:'));
-    expect(publishing).toHaveLength(1);
-    expect(publishing[0]?.startsWith('web:')).toBe(true);
-    expect(publishing[0]).toContain('127.0.0.1');
+    // And only web publishes anything at all, on loopback. The production
+    // override removes even that; compose-prod-exposure.test.ts holds that line.
+    const publishing = [...byName].filter(([, block]) => block.includes('published:'));
+    expect(publishing.map(([name]) => name)).toEqual(['web']);
+    expect(publishing[0]?.[1]).toContain('127.0.0.1');
   });
 });
 

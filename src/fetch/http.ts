@@ -37,6 +37,7 @@ import { FROZEN_POLICY, type FetchPolicy } from './policy';
 
 /** Why a fetch was refused. Stable strings: the handler and tests match on them. */
 export type FetchRefusal =
+  | 'url_has_credentials'
   | 'scheme_not_allowed'
   | 'port_not_allowed'
   | 'dns_failed'
@@ -74,6 +75,31 @@ export interface FetchOutcome {
 
 /** Validates a URL's shape. Cheap, and never the only check. */
 export function assertAllowedUrl(target: URL, policy: FetchPolicy): void {
+  // Credentials in the URL, before anything else happens.
+  //
+  // The URL comes from a job payload, so a username or password in it is an
+  // attempt to make the fetcher authenticate as somebody — and it is refused
+  // whether or not the HTTP client would actually transmit it. undici 8 does
+  // not send an Authorization header for userinfo, but that is a property of
+  // this client version, not a guarantee: a different version, or a switch to
+  // global fetch, could start sending it.
+  //
+  // The concrete harm does not need the header at all. url and final_url are
+  // persisted on the snapshot and returned to the worker, so accepting
+  // http://user:pass@host/ would write a credential into web_snapshots.url in
+  // plaintext and log it — which §17 forbids outright.
+  //
+  // Checked here means checked on every redirect hop too, because every hop
+  // re-enters this function.
+  if (target.username !== '' || target.password !== '') {
+    throw new FetchRefused(
+      'url_has_credentials',
+      'the URL carries userinfo credentials, which a job may not introduce',
+      // Deliberately not target.href: that is the string holding the secret.
+      `${target.protocol}//${target.host}${target.pathname}`,
+    );
+  }
+
   if (!policy.allowedSchemes.includes(target.protocol)) {
     throw new FetchRefused(
       'scheme_not_allowed',
