@@ -104,6 +104,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '001_init.sql',
       '002_roles.sql',
       '003_scheduler_heartbeat.sql',
+      '004_fetcher_snapshot_grants.sql',
     ]);
     expect(result.skipped).toStrictEqual([]);
   });
@@ -115,6 +116,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '001_init.sql',
       '002_roles.sql',
       '003_scheduler_heartbeat.sql',
+      '004_fetcher_snapshot_grants.sql',
     ]);
   });
 
@@ -124,7 +126,12 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
     const client = await pool.connect();
     try {
       await client.query('SET ROLE operator_migrate');
-      for (const file of ['001_init.sql', '002_roles.sql', '003_scheduler_heartbeat.sql']) {
+      for (const file of [
+        '001_init.sql',
+        '002_roles.sql',
+        '003_scheduler_heartbeat.sql',
+        '004_fetcher_snapshot_grants.sql',
+      ]) {
         await client.query(readFileSync(join(migrationsDir, file), 'utf8'));
       }
     } finally {

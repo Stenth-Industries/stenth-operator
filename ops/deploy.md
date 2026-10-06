@@ -329,6 +329,26 @@ Never reach for `docker compose down -v` on the VPS to resolve this. That
 deletes the volume and every prospect, assessment and approval in it. It is the
 right move only on a throwaway local stack.
 
+## The fetcher
+
+Day 3 adds the `fetcher` container: the only process that opens a connection to
+the public internet and the only one that handles hostile input. It publishes
+**no host port** — the worker reaches it at `http://fetcher:8081` on the
+project's own network.
+
+It needs two values in `.env`:
+
+| Variable | Why |
+|---|---|
+| `FETCHER_SHARED_SECRET` | The worker authenticates with it; the fetcher rejects anything else. `openssl rand -hex 32` |
+| `FETCH_DATABASE_URL` | Its connection as `operator_fetch` |
+
+And the worker needs `FETCHER_URL` plus the same shared secret. All three are in
+`.env.example`.
+
+The fetcher refuses to start if `MODEL_API_KEY` appears in its environment: it
+holds no model credential, and that is enforced rather than documented.
+
 ## The worker
 
 Day 2 adds the `worker` container: the claim loop with four handlers in-process,
@@ -415,7 +435,7 @@ it, and must not.
 | Role | Holds |
 |---|---|
 | `operator_app` | DML on application tables. The web app and the worker |
-| `operator_fetch` | Insert into `web_snapshots`, maintain `robots_cache`. Nothing else — the fetcher service only |
+| `operator_fetch` | Insert into `web_snapshots` and read back only its `id`, `company_id`, `url` and `content_hash`; maintain `robots_cache`. Nothing else — the fetcher service only, and it cannot read the page text it writes |
 | `operator_sched` | Read and update `schedules`, insert into `jobs` |
 | `operator_migrate` | DDL. The migration step only; owns every table |
 | `operator_ro` | Read-only, for ad-hoc queries |

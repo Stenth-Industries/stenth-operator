@@ -55,8 +55,20 @@ const envSchema = z.object({
   /** Service name on every log line, so one stdout stream stays readable. */
   SERVICE_NAME: z.string().min(1).default('web'),
 
-  /** Fetcher shared secret (§8, §17). Required from Day 3. */
+  /** Fetcher shared secret (§8, §17). Required by the fetcher and the worker. */
   FETCHER_SHARED_SECRET: z.string().min(32).optional(),
+
+  /**
+   * The fetcher's own connection, as operator_fetch (§17): insert a snapshot,
+   * maintain the robots cache, and nothing else. Required by the fetcher.
+   */
+  FETCH_DATABASE_URL: postgresUrl.optional(),
+
+  /** Where the worker reaches the fetcher over the internal Docker network. */
+  FETCHER_URL: z.string().url().optional(),
+
+  /** The port the fetcher listens on inside the Docker network. */
+  FETCHER_PORT: z.coerce.number().int().positive().max(65535).default(8081),
 
   /** Session signing key (§13, §17). Required from Day 8. */
   SESSION_SIGNING_KEY: z.string().min(32).optional(),

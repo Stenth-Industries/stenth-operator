@@ -19,9 +19,9 @@
 #   3. A mem_limit on every container. The box has ~2.7 GB free of 4 GB, and an
 #      Operator container that balloons must hit its own ceiling rather than
 #      starve the client's n8n. Steady state is postgres 1 GiB + web 512 MiB +
-#      worker 384 MiB = 1.875 GiB; the migration step adds 256 MiB while it
-#      runs. A cold image build needs roughly another 850 MiB, measured, so
-#      builds happen with the stack down (ops/deploy.md).
+#      worker 384 MiB + fetcher 320 MiB = 2.1875 GiB; the migration step adds
+#      256 MiB while it runs. A cold image build needs roughly another 850 MiB,
+#      measured, so builds happen with the stack down (ops/deploy.md).
 #
 # Ports 80 and 443 are already published by the existing Caddy, so Operator
 # cannot bind them as §20 describes. That is an open deviation awaiting a
@@ -113,14 +113,62 @@ services:
       # worker checks this itself at startup and exits with an explanation,
       # which fails just as fast and leaves the box operable.
       SCHED_DATABASE_URL: ${SCHED_DATABASE_URL}
+      # Where the worker asks the fetcher to do the dangerous part (§8). An
+      # internal DNS name on the project's own network, never a host port.
+      FETCHER_URL: ${FETCHER_URL:-http://fetcher:8081}
+      FETCHER_SHARED_SECRET: ${FETCHER_SHARED_SECRET}
       NODE_OPTIONS: --max-old-space-size=256
     mem_limit: 384m
     memswap_limit: 384m
     depends_on:
       postgres:
         condition: service_healthy
+      fetcher:
+        condition: service_started
     networks:
       - internal
+
+  # The fetcher of §8: the only process that opens a connection to the public
+  # internet and the only one that handles hostile input.
+  #
+  # No published host port, no model key, no mail credential, and a database URL
+  # for operator_fetch — whose entire reach is a snapshot insert and the robots
+  # cache. It cannot read back the text it writes.
+  fetcher:
+    build:
+      context: .
+      target: fetcher
+      secrets:
+        - npm_ca
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: fetcher
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      FETCHER_PORT: 8081
+      FETCH_DATABASE_URL: ${FETCH_DATABASE_URL}
+      FETCHER_SHARED_SECRET: ${FETCHER_SHARED_SECRET}
+      # DATABASE_URL is required by config.ts on boot but must never be the
+      # application role here: the fetcher gets its own narrow connection and
+      # this points at the same one, so a mistake cannot widen its reach.
+      DATABASE_URL: ${FETCH_DATABASE_URL}
+      NODE_OPTIONS: --max-old-space-size=192
+    mem_limit: 320m
+    memswap_limit: 320m
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    # No `ports:` key at all. The worker reaches it at http://fetcher:8081 on
+    # the project's own network; nothing outside Docker can.
+    healthcheck:
+      test:
+        ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
 
   web:
     build:

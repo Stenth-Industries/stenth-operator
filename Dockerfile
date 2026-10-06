@@ -30,12 +30,26 @@ COPY . .
 RUN npm run build
 
 # --- tools: the migration step (§20 "docker compose run --rm migrate") --------
+#
+# --chown=node:node on every COPY into a target that later runs as USER node.
+#
+# COPY preserves the host's file modes and only normalises the destination
+# directory, so a checkout made under a leaked `umask 077` arrives as 600 files
+# inside 700 nested directories, owned by root — and the non-root runtime user
+# cannot traverse or read its own application. That reached production once.
+# Giving the files to node makes the owner bits the ones that apply, so 600
+# becomes "node can read it" and 700 "node can traverse it", and the image no
+# longer depends on the permissions of whoever ran git. The runbook's pre-build
+# checks stay as defence in depth; this removes the dependency.
+#
+# Not --chmod=0755: that would make every source file executable, which is a
+# wider change than the problem needs.
 FROM base AS tools
 ENV NODE_ENV=production
-COPY --from=deps /app/node_modules ./node_modules
-COPY package.json tsconfig.json ./
-COPY migrations ./migrations
-COPY src ./src
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json tsconfig.json ./
+COPY --chown=node:node migrations ./migrations
+COPY --chown=node:node src ./src
 USER node
 CMD ["npm", "run", "migrate"]
 
@@ -46,12 +60,27 @@ CMD ["npm", "run", "migrate"]
 # second build pipeline to keep in step.
 FROM base AS worker
 ENV NODE_ENV=production
-COPY --from=deps /app/node_modules ./node_modules
-COPY package.json tsconfig.json ./
-COPY migrations ./migrations
-COPY src ./src
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json tsconfig.json ./
+COPY --chown=node:node migrations ./migrations
+COPY --chown=node:node src ./src
 USER node
 CMD ["npx", "tsx", "src/worker/index.ts"]
+
+# --- fetcher: the one process that touches hostile input (§8, §20) ------------
+#
+# Deliberately the same shape as the others and deliberately the narrowest
+# runtime: it is handed no model key, no mail credential, and a database URL for
+# operator_fetch. It publishes no host port — compose gives it none — and it
+# refuses to start if a model key appears in its environment.
+FROM base AS fetcher
+ENV NODE_ENV=production
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json tsconfig.json ./
+COPY --chown=node:node src ./src
+USER node
+EXPOSE 8081
+CMD ["npx", "tsx", "src/fetcher/server.ts"]
 
 # --- web ----------------------------------------------------------------------
 FROM base AS web

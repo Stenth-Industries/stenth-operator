@@ -22,12 +22,12 @@ the target host.
 |---|---|
 | 1 — repo, config, Compose with Postgres, migration 001, five DB roles, `/api/health`, pino with trace ids, CI | Done and deployed |
 | 2 — job engine: enqueue, claim, retries, backoff, reaper, `job_runs`, events, and the in-process scheduler under an advisory lock | Done |
-| 3 — the fetcher as its own service | Not started |
+| 3 — the fetcher as its own service: SSRF guard, caps, robots, politeness, HTML to text, `web_snapshots`, narrow role, authenticated internal endpoint | Done |
+| 4 — isolated extraction and the Tier A scanner | Not started |
 
-Day 2 registers no business handlers: each belongs to the day that builds it.
-A claimed job with no handler fails through the ordinary path — retried, then
-dead with an alert — and production has nothing enqueuing and no schedules
-enabled, so the queue stays empty until Day 3 puts work in it.
+Day 3 registers one handler, `web.fetch`. The worker never opens a socket to
+the public internet: it asks the fetcher, which is the only process that
+touches hostile input and the only one that can store a snapshot.
 
 ## Local development
 
@@ -66,11 +66,26 @@ migrations/   numbered SQL, forward-only, never edited once applied
 src/
   app/        Next.js: api/health today; the approval queue on Day 8
   db/         client, schema, the migration runner, the health report
+  jobs/       kinds and dedupe keys, enqueue, the queue's transitions
+  worker/     the claim loop, scheduler, reaper, cron, handlers
+  fetch/      the SSRF guard, policy, robots, html-to-text, politeness
+  fetcher/    server.ts — the internal fetch service, and its contract
   obs/        trace ids, logging
   config.ts   zod-validated env, fails fast on boot
 ops/          deploy, Tailscale, open deviations
 tests/        unit/, reliability/
 ```
+
+## The trust boundary
+
+`src/fetch/` and `src/fetcher/` run in their own container, as the only process
+that opens a connection to the public internet. It holds no model key, no mail
+credential, no application or scheduler database role, and no host port. Its
+database role can add a snapshot and maintain the robots cache it obeys — it
+cannot read back the page text it just stored, let alone a contact or a draft.
+
+Everything that crosses back into the privileged zone is parsed with Zod first.
+Page content stays untrusted all the way to Day 4's isolated model call.
 
 ## The rules that keep it this shape
 

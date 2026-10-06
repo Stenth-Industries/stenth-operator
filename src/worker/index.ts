@@ -18,7 +18,8 @@ import { getConfig } from '../config';
 import { createPool } from '../db/client';
 import { claimJob, completeJob, failJob, UnregisteredKindError } from '../jobs/queue';
 import { getLogger, withTrace } from '../obs/log';
-import { getHandler } from './handlers';
+import { getHandler, registerHandler } from './handlers';
+import { handleWebFetch } from './handlers/web-fetch';
 import { reap, DEFAULT_STALE_AFTER_SECONDS } from './reaper';
 import { tick } from './scheduler';
 
@@ -208,6 +209,22 @@ async function main(): Promise<void> {
         'connection and not by convention.',
     );
   }
+
+  if (config.FETCHER_URL === undefined || config.FETCHER_SHARED_SECRET === undefined) {
+    throw new Error(
+      'FETCHER_URL and FETCHER_SHARED_SECRET are required by the worker: web.fetch ' +
+        'is served by the fetcher over the internal network, and the fetcher ' +
+        'rejects an unauthenticated request (SPEC.md §8).',
+    );
+  }
+
+  // Day 3 registers one handler. The worker never fetches anything itself: it
+  // asks the fetcher, which is the only process that touches hostile input.
+  const fetcherUrl = config.FETCHER_URL;
+  const sharedSecret = config.FETCHER_SHARED_SECRET;
+  registerHandler('web.fetch', async (job) => {
+    await handleWebFetch(job, { fetcherUrl, sharedSecret });
+  });
 
   const appPool = createPool(config.DATABASE_URL);
   const schedPool = createPool(config.SCHED_DATABASE_URL);
