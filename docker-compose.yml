@@ -1,0 +1,96 @@
+# STENTH Operator V1.1 — local and single-VPS stack (SPEC.md §20).
+#
+# Day 1 brings up postgres, the migration step and web. worker arrives on Day 2,
+# fetcher on Day 3, and the public/private caddy split on Day 9; each is added
+# to this file on its own day rather than sitting here as a stub.
+#
+# Topology per §20: postgres publishes no host port at all. web publishes only
+# on the loopback interface so it can be reached during development; on the VPS,
+# docker-compose.prod.yml removes that and Caddy becomes the only container with
+# published ports.
+
+name: stenth-operator
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: operator
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Backups run nightly at 02:30 Australia/Sydney (§18).
+      TZ: Australia/Sydney
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d operator"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Runs as its own step, before the new code serves traffic:
+  #   docker compose run --rm migrate
+  migrate:
+    build:
+      context: .
+      target: tools
+    profiles: ["migrate"]
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: migrate
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: ${DATABASE_URL}
+      ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL}
+      OPERATOR_APP_PASSWORD: ${OPERATOR_APP_PASSWORD}
+      OPERATOR_FETCH_PASSWORD: ${OPERATOR_FETCH_PASSWORD}
+      OPERATOR_SCHED_PASSWORD: ${OPERATOR_SCHED_PASSWORD}
+      OPERATOR_MIGRATE_PASSWORD: ${OPERATOR_MIGRATE_PASSWORD}
+      OPERATOR_RO_PASSWORD: ${OPERATOR_RO_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      target: web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: web
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL}
+      AI_BUDGET_MONTHLY_USD: ${AI_BUDGET_MONTHLY_USD:-50}
+      AI_BUDGET_WARN_USD: ${AI_BUDGET_WARN_USD:-35}
+      AI_BUDGET_HARD_STOP_USD: ${AI_BUDGET_HARD_STOP_USD:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    ports:
+      # Loopback only. Removed by docker-compose.prod.yml, where Caddy is the
+      # only container with published host ports (§20).
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test:
+        ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres-data:

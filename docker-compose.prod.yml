@@ -1,0 +1,16 @@
+# Production override (SPEC.md §20).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Removes every published host port from the application containers. On the VPS
+# the only container with published ports is caddy, which arrives on Day 9 with
+# the public/private site split: the public block serves /optout/* and the ACME
+# challenge and returns 404 for everything else, and the private block binds the
+# Tailscale interface and proxies the dashboard.
+
+services:
+  web:
+    ports: !override []
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
