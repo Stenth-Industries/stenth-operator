@@ -420,6 +420,12 @@ function statusSentinelHash(status: number): string {
  * one. Both the RETURNING and the read-back need the four column grants of
  * migration 004 — and nothing wider: text is not among them, so this process
  * cannot read back the hostile content it just wrote.
+ *
+ * The one exception to "a repeat is a no-op" is a missing Tier A scan. The 20
+ * snapshots from Day 3 predate the scanner, and without this they could never
+ * acquire one: re-fetching the same bytes would conflict and change nothing. So
+ * the conflict fills `signals` in when it is NULL — and only then, and only
+ * that column, which is the whole of the UPDATE privilege migration 008 grants.
  */
 async function storeSnapshot(
   pool: Pool,
@@ -441,7 +447,9 @@ async function storeSnapshot(
        (company_id, url, http_status, content_hash, text, bytes, robots_allowed,
         trace_id, signals)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-     ON CONFLICT (company_id, url, content_hash) DO NOTHING
+     ON CONFLICT (company_id, url, content_hash) DO UPDATE
+        SET signals = excluded.signals
+      WHERE web_snapshots.signals IS NULL AND excluded.signals IS NOT NULL
      RETURNING id`,
     [
       snapshot.companyId,
@@ -559,13 +567,30 @@ async function main(): Promise<void> {
         'whose grants are a snapshot insert and the robots cache (SPEC.md §17).',
     );
   }
-  // Structural, not a comment: if a model key ever reaches this process's
+  // Structural, not a comment: if any model key ever reaches this process's
   // environment, it stops rather than carrying a credential it must not have.
-  if (config.MODEL_API_KEY !== undefined) {
-    throw new Error(
-      'MODEL_API_KEY is present in the fetcher environment. The fetcher holds no ' +
-        'model credential (SPEC.md §8, §17); remove it from this service.',
-    );
+  //
+  // Read straight from process.env rather than from the parsed config: a new
+  // vendor key that nobody remembered to add to the config schema would be
+  // invisible to a config-shaped check, and this is the one process §8 assumes
+  // will be compromised.
+  const MODEL_KEY_VARIABLES = [
+    'MODEL_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'OPENAI_API_KEY',
+    'GOOGLE_API_KEY',
+    'GEMINI_API_KEY',
+    'GOOGLE_APPLICATION_CREDENTIALS',
+  ];
+  for (const variable of MODEL_KEY_VARIABLES) {
+    const value = process.env[variable];
+    if (value !== undefined && value.trim() !== '') {
+      throw new Error(
+        `${variable} is present in the fetcher environment. The fetcher holds no ` +
+          'model credential of any kind (SPEC.md §8, §17); remove it from this service.',
+      );
+    }
   }
 
   const pool = createPool(config.FETCH_DATABASE_URL);

@@ -43,6 +43,8 @@
  * by a SQL predicate so the gate is queryable as well as enforced.
  */
 
+import { isFirstPartyUrl } from './domain';
+
 /** §25's acceptance harness floor, for comparison only. Not used in production. */
 export const ACCEPTANCE_TEXT_FLOOR = 500;
 
@@ -90,28 +92,24 @@ export function countDistinctWords(text: string): number {
 }
 
 /**
- * Whether the snapshot's final URL is still on the firm's own domain.
+ * Whether the snapshot's final URL is first-party evidence for the firm.
  *
  * Finding 2 in ops/day3-acceptance/findings.md: §8 re-validates every redirect
- * hop for scheme, port and address but not for host, and the registrable-domain
- * policy is an open decision. Until it is resolved, off-domain evidence is not
- * consumed — so the gate refuses it rather than the extractor silently treating
- * another site's content as this firm's.
+ * hop for scheme, port and address but not for host, so a redirect can land a
+ * snapshot on another site. The policy, approved for Day 5:
  *
- * Host equality against the domain and its `www.` form, not a public-suffix
- * comparison: the suffix list arrives with company.resolve on Day 5, and host
- * equality is the stricter of the two. Tightening now and relaxing later is the
- * safe direction.
+ *   * the firm's own registrable domain (eTLD+1) is first-party, including a
+ *     legitimate subdomain and either direction of apex <-> www;
+ *   * a different registrable domain is not, and is reported rather than
+ *     promoted, until company.resolve verifies it belongs to the same firm.
+ *
+ * Delegated to src/pipeline/domain.ts, which asks the Public Suffix List. The
+ * earlier host-equality version refused a legitimate subdomain and would have
+ * been fooled by nothing — but it also could not tell `firm.com.au` from
+ * `firm.com.attacker.tld` on principle, only by accident of equality.
  */
 export function isOnOwnDomain(finalUrl: string, canonicalDomain: string): boolean {
-  let host: string;
-  try {
-    host = new URL(finalUrl).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  const domain = canonicalDomain.toLowerCase();
-  return host === domain || host === `www.${domain}`;
+  return isFirstPartyUrl(finalUrl, canonicalDomain).sameFirm;
 }
 
 /**
@@ -196,18 +194,23 @@ export function assessEligibility(
 }
 
 /**
- * The same rule as SQL, for the dashboard and for ad-hoc counting.
+ * The measurable part of the rule, as SQL, for the dashboard and for counting.
  *
- * Deliberately a mirror rather than the implementation: the gate that decides
- * whether money is spent runs in code, where it is unit-tested against real
- * Day 3 text. A query that disagreed with it would be a reporting bug, and a
- * test asserts the two agree row by row.
+ * Deliberately **not** the whole gate. The first-party test needs the Public
+ * Suffix List, and SQL has no access to it — the previous version of this
+ * constant approximated it with host equality, which both refused legitimate
+ * subdomains and could not tell `firm.com.au` from `firm.com.au.attacker.tld`
+ * on principle. An approximation in the reporting query is worse than an
+ * honest gap, because it reads as agreement.
+ *
+ * So this covers status, permission, text presence and length, and the domain
+ * decision stays in code where the list is. A test asserts the containment that
+ * matters: everything the code accepts, this accepts — the difference is
+ * exactly the off-domain rows.
  */
 export const ELIGIBLE_SNAPSHOT_SQL = `
   SELECT s.id
     FROM usable_snapshots s
     JOIN companies c ON c.id = s.company_id
    WHERE length(regexp_replace(s.text, '\\s+', ' ', 'g')) >= ${MIN_EXTRACT_CHARS}
-     AND lower(split_part(regexp_replace(s.url, '^https?://', ''), '/', 1))
-           IN (lower(c.canonical_domain::text), 'www.' || lower(c.canonical_domain::text))
 `;

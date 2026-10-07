@@ -95,6 +95,23 @@ const envSchema = z.object({
    */
   MODEL_PROVIDER: z.string().min(1).optional(),
 
+  /**
+   * The model id for each bake-off family (§22).
+   *
+   * Configuration, never a constant: which model a family fields is a product
+   * decision with a price attached, and §22 decides it from measurement. An
+   * adapter whose model id is unset cannot be registered, so a half-configured
+   * family fails at boot rather than running on a guess.
+   */
+  ANTHROPIC_MODEL: z.string().min(1).optional(),
+  OPENAI_MODEL: z.string().min(1).optional(),
+  GOOGLE_MODEL: z.string().min(1).optional(),
+
+  /** Overridable endpoints, for a gateway or a regional endpoint. */
+  ANTHROPIC_BASE_URL: z.string().url().optional(),
+  OPENAI_BASE_URL: z.string().url().optional(),
+  GOOGLE_BASE_URL: z.string().url().optional(),
+
   /** The model credential (§17). Never logged, never in a committed file. */
   MODEL_CALLS_ENABLED: z
     .enum(['true', 'false'])

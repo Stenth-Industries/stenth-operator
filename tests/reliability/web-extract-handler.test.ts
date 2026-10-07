@@ -23,6 +23,7 @@ import {
   setOfflineReply,
 } from '../../src/ai/providers/offline';
 import type { ModelProvider } from '../../src/ai/provider';
+import { openReservations } from '../../src/ai/budget';
 import { scanTierASignals } from '../../src/fetch/signals';
 import { enqueue } from '../../src/jobs/enqueue';
 import { dedupeKey } from '../../src/jobs/kinds';
@@ -31,6 +32,7 @@ import { newTraceId } from '../../src/obs/trace';
 import {
   ELIGIBLE_SNAPSHOT_SQL,
   assessEligibility,
+  isOnOwnDomain,
   type SnapshotForEligibility,
 } from '../../src/pipeline/evidence';
 import { ExtractBlocked, handleWebExtract } from '../../src/worker/handlers/web-extract';
@@ -370,7 +372,7 @@ describeWithDb('the web.extract handler (§6, §8, §16)', () => {
       const b = await claimJob(app, 'test-worker-2');
       expect(b).toBeDefined();
 
-      const [first, second] = await Promise.all([
+      const outcomes = await Promise.allSettled([
         handleWebExtract(a, deps()),
         handleWebExtract(b!, deps()),
       ]);
@@ -379,12 +381,20 @@ describeWithDb('the web.extract handler (§6, §8, §16)', () => {
         'SELECT count(*) AS count FROM extractions',
       );
       expect(rows[0]?.count).toBe('1');
-      // Both report the same row, and both calls that actually happened are
-      // recorded: a charge that is not recorded is a charge the budget misses.
-      const ids = [first, second].map((result) =>
-        result.outcome === 'extracted' ? result.extractionId : (result as { extractionId: string }).extractionId,
+
+      // One did the work; the other was refused by the reservation rather than
+      // calling the provider a second time. Exactly one call row exists.
+      const refused = outcomes.filter((outcome) => outcome.status === 'rejected');
+      expect(refused.length).toBeLessThanOrEqual(1);
+      for (const outcome of refused) {
+        expect(((outcome as PromiseRejectedResult).reason as ExtractBlocked).reason).toBe(
+          'reservation_in_flight',
+        );
+      }
+      const calls = await app.query<{ count: string }>(
+        'SELECT count(*) AS count FROM llm_calls',
       );
-      expect(new Set(ids).size).toBe(1);
+      expect(calls.rows[0]?.count).toBe('1');
     });
   });
 
@@ -527,7 +537,7 @@ describeWithDb('the web.extract handler (§6, §8, §16)', () => {
         const job = await claimExtractJob(snapshotId);
         const error = await handleWebExtract(job, deps()).catch((caught: unknown) => caught);
         expect(error).toBeInstanceOf(ExtractBlocked);
-        expect((error as ExtractBlocked).reason).toBe('no_pricing');
+        expect((error as ExtractBlocked).reason).toBe('missing_pricing');
       } finally {
         await db.adminPool.query(
           `INSERT INTO model_pricing (provider, model, input_per_mtok, output_per_mtok, effective_from)
@@ -561,6 +571,183 @@ describeWithDb('the web.extract handler (§6, §8, §16)', () => {
       // what matters is that it is recorded, not that it is zero.
       expect(Number(rows[0]?.total)).toBeGreaterThanOrEqual(0);
     });
+  });
+
+  describe('the reservation is what stops a second provider call', () => {
+    it('reserves before calling, and finalises in the same transaction as the fact', async () => {
+      const snapshotId = await insertSnapshot();
+      const job = await claimExtractJob(snapshotId);
+      await handleWebExtract(job, deps());
+
+      const { rows } = await app.query<{
+        status: string;
+        reservation_key: string;
+        reserved_at: Date;
+        finalized_at: Date;
+        estimated_cost_usd: string;
+        cost_usd: string;
+      }>(
+        `SELECT status, reservation_key, reserved_at, finalized_at,
+                estimated_cost_usd, cost_usd
+           FROM llm_calls`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe('succeeded');
+      expect(rows[0]?.reservation_key).toContain(`web.extract:${snapshotId}:`);
+      expect(rows[0]?.reservation_key).toContain(OFFLINE_MODEL);
+      expect(rows[0]?.reserved_at).not.toBeNull();
+      expect(rows[0]?.finalized_at).not.toBeNull();
+      // The estimate was pessimistic; the actual is what was billed.
+      expect(Number(rows[0]?.cost_usd)).toBeLessThanOrEqual(
+        Number(rows[0]?.estimated_cost_usd),
+      );
+    }, 60_000);
+
+    it('two workers racing one snapshot invoke the provider once', async () => {
+      // The requirement, measured at the provider rather than inferred: the
+      // offline adapter counts its own invocations.
+      const snapshotId = await insertSnapshot();
+      let invocations = 0;
+      const counting: ModelProvider = {
+        ...offlineProvider,
+        complete(providerRequest) {
+          invocations += 1;
+          return offlineProvider.complete(providerRequest);
+        },
+      };
+
+      const a = await claimExtractJob(snapshotId);
+      await enqueue(app, {
+        kind: 'web.extract',
+        dedupeKey: `${dedupeKey.webExtract(snapshotId, EXTRACTION_SCHEMA_VERSION)}:second`,
+        traceId: newTraceId(),
+        payload: { snapshot_id: snapshotId },
+      });
+      const b = await claimJob(app, 'test-worker-2');
+
+      const outcomes = await Promise.allSettled([
+        handleWebExtract(a, { pool: app, provider: counting, modelCallsEnabled: false }),
+        handleWebExtract(b!, { pool: app, provider: counting, modelCallsEnabled: false }),
+      ]);
+
+      expect(invocations).toBe(1);
+
+      const fulfilled = outcomes.filter((outcome) => outcome.status === 'fulfilled');
+      const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+      // One did the work. The other either saw the finished extraction or was
+      // refused by the reservation — both are correct, and neither called out.
+      expect(fulfilled.length + rejected.length).toBe(2);
+      for (const outcome of rejected) {
+        expect((outcome as PromiseRejectedResult).reason).toBeInstanceOf(ExtractBlocked);
+        expect(((outcome as PromiseRejectedResult).reason as ExtractBlocked).reason).toBe(
+          'reservation_in_flight',
+        );
+      }
+
+      const { rows } = await app.query<{ count: string }>(
+        'SELECT count(*) AS count FROM extractions',
+      );
+      expect(rows[0]?.count).toBe('1');
+    }, 60_000);
+
+    it('a provider failure after reservation blocks for reconciliation, not retry', async () => {
+      const snapshotId = await insertSnapshot();
+      const job = await claimExtractJob(snapshotId);
+      const exploding: ModelProvider = {
+        ...offlineProvider,
+        complete() {
+          return Promise.reject(new Error('socket hang up'));
+        },
+      };
+
+      const error = await handleWebExtract(job, {
+        pool: app,
+        provider: exploding,
+        modelCallsEnabled: false,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ExtractBlocked);
+      expect((error as ExtractBlocked).reason).toBe('reservation_in_flight');
+      expect((error as Error).message).toMatch(/Reconcile it/);
+
+      // The reservation stands, the budget is still committed to it, and no
+      // extraction was written.
+      const open = await openReservations(app);
+      expect(open).toHaveLength(1);
+      const { rows } = await app.query<{ count: string }>(
+        'SELECT count(*) AS count FROM extractions',
+      );
+      expect(rows[0]?.count).toBe('0');
+
+      // A retry cannot call out again.
+      const retryJob = await claimExtractJob(snapshotId).catch(() => undefined);
+      if (retryJob !== undefined) {
+        const second = await handleWebExtract(retryJob, {
+          pool: app,
+          provider: exploding,
+          modelCallsEnabled: false,
+        }).catch((caught: unknown) => caught);
+        expect((second as ExtractBlocked).reason).toBe('reservation_in_flight');
+      }
+    }, 60_000);
+
+    it('a refusal before any reservation costs nothing and blocks no retry', async () => {
+      await db.adminPool.query('DELETE FROM model_pricing');
+      try {
+        const snapshotId = await insertSnapshot();
+        const job = await claimExtractJob(snapshotId);
+        const error = await handleWebExtract(job, deps()).catch((caught: unknown) => caught);
+        expect((error as ExtractBlocked).reason).toBe('missing_pricing');
+
+        const { rows } = await app.query<{
+          status: string;
+          cost_usd: string;
+          reservation_key: string | null;
+        }>('SELECT status, cost_usd, reservation_key FROM llm_calls');
+        expect(rows[0]?.status).toBe('blocked');
+        expect(Number(rows[0]?.cost_usd)).toBe(0);
+        expect(rows[0]?.reservation_key).toBeNull();
+      } finally {
+        await db.adminPool.query(
+          `INSERT INTO model_pricing (provider, model, input_per_mtok, output_per_mtok, effective_from)
+           VALUES ($1, $2, 3.000000, 15.000000, now() - interval '1 day')`,
+          [OFFLINE_PROVIDER_ID, OFFLINE_MODEL],
+        );
+      }
+    }, 60_000);
+
+    it('distinguishes every blocked reason as its own code', async () => {
+      // One generic "blocked" would tell an operator nothing. Each of these
+      // needs a different response, so each is its own token.
+      const reasons = new Set<string>();
+
+      const billable: ModelProvider = { ...offlineProvider, id: 'billable', billable: true };
+      const disabled = await handleWebExtract(
+        await claimExtractJob(await insertSnapshot()),
+        { pool: app, provider: billable, modelCallsEnabled: false },
+      ).catch((caught: unknown) => caught);
+      reasons.add((disabled as ExtractBlocked).reason);
+
+      await db.adminPool.query(
+        `INSERT INTO budgets (period_month, limit_usd, warn_usd, hard_stop_usd)
+         VALUES (date_trunc('month', now())::date, 50, 35, 50)
+         ON CONFLICT (period_month) DO NOTHING`,
+      );
+      // hard_stop must stay at or above limit (§4), so the whole window moves.
+      await db.adminPool.query(
+        'UPDATE budgets SET limit_usd = 0, warn_usd = 0, hard_stop_usd = 0',
+      );
+      const ceiling = await handleWebExtract(
+        await claimExtractJob(await insertSnapshot()),
+        deps(),
+      ).catch((caught: unknown) => caught);
+      reasons.add((ceiling as ExtractBlocked).reason);
+      await db.adminPool.query(
+        'UPDATE budgets SET limit_usd = 50, warn_usd = 35, hard_stop_usd = 50',
+      );
+
+      expect([...reasons].sort()).toStrictEqual(['budget_hard_stop', 'model_calls_disabled']);
+    }, 60_000);
   });
 
   // --------------------------------------------------------------- provenance
@@ -633,6 +820,7 @@ describeWithDb('the SQL mirror agrees with the code gate', () => {
     const cases: { text: string | null; status: number | null; robots: boolean; url: string }[] = [
       { text: long, status: 200, robots: true, url: 'https://mirror.example/' },
       { text: long, status: 200, robots: true, url: 'https://www.mirror.example/about' },
+      { text: long, status: 200, robots: true, url: 'https://nsw.mirror.example/offices' },
       { text: long, status: 200, robots: true, url: 'https://elsewhere.example/' },
       { text: 'too short', status: 200, robots: true, url: 'https://mirror.example/thin' },
       { text: null, status: null, robots: false, url: 'https://mirror.example/private' },
@@ -664,8 +852,24 @@ describeWithDb('the SQL mirror agrees with the code gate', () => {
       .filter((row) => assessEligibility(row, { alreadyExtracted: false }).eligible)
       .map((row) => row.id);
 
-    expect(fromSql.rows.map((row) => row.id).sort()).toStrictEqual(fromCode.sort());
-    // And it is not vacuously equal: the two on-domain long pages qualify.
-    expect(fromCode).toHaveLength(2);
+    // Containment, not equality: the SQL cannot ask the Public Suffix List, so
+    // it accepts a superset and the difference is exactly the off-domain rows.
+    const sqlIds = fromSql.rows.map((row) => row.id).sort();
+    for (const id of fromCode) {
+      expect(sqlIds, 'the SQL mirror must accept everything the code accepts').toContain(id);
+    }
+
+    const extra = sqlIds.filter((id) => !fromCode.includes(id));
+    const offDomain = all.rows
+      .filter((row) => !isOnOwnDomain(row.url, row.canonical_domain))
+      .map((row) => row.id);
+    expect(extra.sort()).toStrictEqual(
+      extra.filter((id) => offDomain.includes(id)).sort(),
+    );
+
+    // And it is not vacuously true: the apex, the www form and a subdomain all
+    // qualify, and the off-domain page is the one the code refuses.
+    expect(fromCode).toHaveLength(3);
+    expect(extra).toHaveLength(1);
   });
 });

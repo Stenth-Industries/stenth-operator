@@ -28,7 +28,7 @@ import { getLogger, withTrace } from '../obs/log';
 import { getHandler, registerHandler } from './handlers';
 import { resolveProvider, type ModelProvider } from '../ai/provider';
 import { registerAvailableProviders } from '../ai/providers';
-import { handleWebExtract } from './handlers/web-extract';
+import { ExtractBlocked, handleWebExtract } from './handlers/web-extract';
 import { handleWebFetch } from './handlers/web-fetch';
 import { reap, DEFAULT_STALE_AFTER_SECONDS } from './reaper';
 import { tick } from './scheduler';
@@ -263,27 +263,42 @@ async function main(): Promise<void> {
   // only when a provider exists; without one, a web.extract job fails through
   // the ordinary unregistered-kind path, visibly.
   registerAvailableProviders();
-  let provider: ModelProvider | undefined;
-  try {
-    provider = resolveProvider(config.MODEL_PROVIDER);
-  } catch (error) {
-    log.warn(
-      { err: error },
-      'no model provider is configured: web.extract is not registered (§1, §22)',
-    );
-  }
-  if (provider !== undefined) {
-    const resolved = provider;
-    registerHandler('web.extract', async (job) => {
-      await handleWebExtract(job, {
-        pool: appPool,
-        provider: resolved,
-        modelCallsEnabled: config.MODEL_CALLS_ENABLED,
-      });
+
+  // Registered unconditionally, and the provider resolved per job.
+  //
+  // Not "register only if a provider exists": a web.extract job on a
+  // deployment with no MODEL_PROVIDER would then fail as an unregistered kind,
+  // which tells an operator nothing about why. Resolving here turns it into a
+  // blocked job carrying `provider_unconfigured`, which names the decision that
+  // has not been made (§1, §22).
+  registerHandler('web.extract', async (job) => {
+    let provider: ModelProvider;
+    try {
+      provider = resolveProvider(config.MODEL_PROVIDER);
+    } catch (error) {
+      throw new ExtractBlocked(
+        'provider_unconfigured',
+        error instanceof Error ? error.message : 'no model provider is configured',
+      );
+    }
+    await handleWebExtract(job, {
+      pool: appPool,
+      provider,
+      modelCallsEnabled: config.MODEL_CALLS_ENABLED,
     });
+  });
+
+  try {
+    const resolved = resolveProvider(config.MODEL_PROVIDER);
     log.info(
       { provider: resolved.id, model: resolved.model, billable: resolved.billable },
       'web.extract registered',
+    );
+  } catch (error) {
+    log.warn(
+      { err: error },
+      'web.extract is registered but no model provider is configured: its jobs ' +
+        'will be blocked with provider_unconfigured until the Day 6 decision is set',
     );
   }
   const schedPool = createPool(config.SCHED_DATABASE_URL);

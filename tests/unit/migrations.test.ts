@@ -302,3 +302,77 @@ describe('migration 006: web_snapshots.signals (§9, §23 case 13)', () => {
     expect(statements).not.toMatch(/usable_snapshots/);
   });
 });
+
+/**
+ * Migration 007: the hard stop becomes atomic.
+ *
+ * §16's control is only a control if it cannot be overtaken. The reservation
+ * design is in src/ai/budget.ts; these are the schema facts it rests on.
+ */
+describe('migration 007: reservations (§16)', () => {
+  const sql = readFileSync(join(migrationsDir, '007_llm_call_reservations.sql'), 'utf8');
+  const statements = statementsOnly(sql);
+
+  it('adds the two states a reservation needs', () => {
+    expect(statements).toMatch(/ADD VALUE IF NOT EXISTS 'reserved'/);
+    expect(statements).toMatch(/ADD VALUE IF NOT EXISTS 'abandoned'/);
+  });
+
+  it('makes one provider invocation per piece of work structural', () => {
+    expect(statements).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS llm_calls_reservation_key_idx/);
+    expect(statements).toMatch(/WHERE reservation_key IS NOT NULL/);
+  });
+
+  it('carries no status predicate on that index, so a release can free the work', () => {
+    // ALTER TYPE ... ADD VALUE cannot be used in the same transaction, and an
+    // abandoned reservation must stop blocking the retry it exists to permit.
+    const index = /CREATE UNIQUE INDEX[\s\S]*?;/.exec(statements)?.[0] ?? '';
+    expect(index).not.toContain('status');
+  });
+
+  it('keeps the estimate alongside the actual, so over-reservation is measurable', () => {
+    expect(statements).toMatch(/estimated_cost_usd\s+numeric\(12, 6\)/);
+    expect(statements).toMatch(/reserved_at/);
+    expect(statements).toMatch(/finalized_at/);
+  });
+
+  it('records who reconciled an ambiguous call, and why', () => {
+    expect(statements).toMatch(/reconciled_by/);
+    expect(statements).toMatch(/reconciliation_note/);
+  });
+
+  it('deletes nothing and drops nothing', () => {
+    expect(statements).not.toMatch(/\bDELETE\b/i);
+    expect(statements).not.toMatch(/\bDROP\b/i);
+    expect(statements).not.toMatch(/\bTRUNCATE\b/i);
+  });
+});
+
+/**
+ * Migration 008: the fetcher may fill in a missing scan, and nothing else.
+ */
+describe('migration 008: the signals backfill grant (§9, §17)', () => {
+  const sql = readFileSync(join(migrationsDir, '008_fetcher_signal_backfill.sql'), 'utf8');
+  const statements = statementsOnly(sql);
+
+  it('grants UPDATE on one column, never on the table', () => {
+    expect(statements).toContain('GRANT UPDATE (signals) ON TABLE web_snapshots TO operator_fetch');
+    expect(statements).not.toMatch(/GRANT UPDATE ON TABLE/);
+    expect(statements).not.toMatch(/GRANT UPDATE \((?!signals\))/);
+  });
+
+  it('reads back only the column it writes, and never the page text', () => {
+    // The conflict's own guard — "fill it in where it is NULL" — is a read of
+    // `signals`, so the fetcher needs SELECT on that one column. Derived
+    // booleans it produced itself; `text` stays unreadable to this role.
+    expect(statements).toContain('GRANT SELECT (signals) ON TABLE web_snapshots TO operator_fetch');
+    expect(statements).not.toMatch(/GRANT SELECT \((?!signals\))/);
+    expect(statements).not.toMatch(/GRANT SELECT ON TABLE/);
+  });
+
+  it('grants nothing wider, and nothing to another role', () => {
+    expect(statements).not.toMatch(/GRANT (DELETE|INSERT|ALL)/);
+    expect(statements).not.toMatch(/TO operator_(app|sched|migrate|ro)/);
+    expect(statements).not.toMatch(/TO PUBLIC/i);
+  });
+});

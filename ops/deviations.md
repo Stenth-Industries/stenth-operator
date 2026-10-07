@@ -159,3 +159,51 @@ without a database or a provider.
 an abstraction with a single caller. This is neither — `pipeline/` already
 exists, and the gate has two callers already (the handler and the SQL mirror
 test) with Day 5's `company.resolve` to come.
+
+---
+
+# Day 4 review deviations
+
+Three further departures, all from the review of 2026-10-08. The four recorded
+above (`signals` jsonb, `paid_search_tag: unknown`, the widened `blocked` state,
+`pipeline/evidence.ts`) were provisionally approved and stand.
+
+## 8. `llm_calls` gains six columns and two states
+
+§4's `llm_calls` lists provider, model, token counts, cost, latency, status and
+request hash — a record of a call that happened. §16's hard stop cannot be built
+on that alone: a row written after the call cannot stop the call, and two
+workers reading the same month-to-date both pass.
+
+Migration 007 adds `reservation_key`, `estimated_cost_usd`, `reserved_at`,
+`finalized_at`, `reconciled_by`, `reconciliation_note`, and the states `reserved`
+and `abandoned`. The table becomes a reservation ledger as well as a record,
+which is what makes "check before the call" a control rather than a report.
+
+§4 names "key columns and constraints" rather than an exhaustive list, every
+addition is nullable, and nothing existing changed meaning — except `cost_usd`,
+which now holds the pessimistic estimate while a row is `reserved`. That is
+deliberate: it keeps month-to-date a plain `sum(cost_usd)`, with no status
+filter for a future query to get wrong, and it is documented on the column.
+
+## 9. `operator_fetch` may write and read one derived column
+
+Migration 002 gave the fetcher INSERT on `web_snapshots` and nothing else, and
+the privilege matrix test asserts UPDATE is refused. Migration 008 grants
+`UPDATE (signals)` and `SELECT (signals)` — one column, because the 20 Day 3
+snapshots can only acquire a Tier A scan through a re-fetch, and a re-fetch of
+unchanged bytes conflicts on `(company_id, url, content_hash)` and would change
+nothing.
+
+The statement writes only where `signals IS NULL`, so an existing scan cannot be
+overwritten; the SELECT exists because that guard reads the column. `text`,
+`url`, `http_status`, `content_hash` and `bytes` all remain refused to the
+fetcher, each asserted by its own case.
+
+## 10. The eligibility threshold is not frozen
+
+Recorded because the code currently says 1,000 characters and 50 distinct words
+and that is **not** a decision yet. `ops/day4-extraction/thresholds.ts` produces
+the comparison against the real corpus; the number changes in one constant when
+the data is in. Day 4 must not be deployed as the final gate until that table
+has been read.

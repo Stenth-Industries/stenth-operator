@@ -276,8 +276,27 @@ describeWithDb('operator_fetch holds exactly the privileges the fetcher needs', 
         'web_snapshots.company_id:SELECT',
         'web_snapshots.content_hash:SELECT',
         'web_snapshots.id:SELECT',
+        // Migration 008: the fetcher reads back the Tier A scan it writes, so
+        // "fill it in where it is missing" can be one statement. Derived
+        // booleans, never page content — `text` is still absent from this list.
+        'web_snapshots.signals:SELECT',
         'web_snapshots.url:SELECT',
       ]);
+    });
+
+    it('may fill in a missing Tier A scan, and may not rewrite anything else', async () => {
+      // Migration 008's whole grant: UPDATE on one derived column. The page
+      // itself stays immutable to the role that fetched it.
+      await attempt(
+        `UPDATE web_snapshots SET signals = '{"signals_version":"x"}'::jsonb
+          WHERE signals IS NULL`,
+      );
+      for (const column of ['text', 'url', 'http_status', 'content_hash', 'bytes']) {
+        await expect(
+          attempt(`UPDATE web_snapshots SET ${column} = NULL`),
+          column,
+        ).rejects.toThrow(/permission denied/);
+      }
     });
 
     it('may change its own password, which buys it nothing', async () => {

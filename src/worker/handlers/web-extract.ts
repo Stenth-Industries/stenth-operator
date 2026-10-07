@@ -27,7 +27,12 @@
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
 
-import { checkBudget, recordCall } from '../../ai/budget';
+import {
+  finalizeCall,
+  recordRefusal,
+  reserveCall,
+  type RefusalReason,
+} from '../../ai/budget';
 import { isolatedExtract, MAX_OUTPUT_TOKENS, PROMPT_VERSION, requestHashFor } from '../../ai/isolated';
 import { attestValidated, type Validated } from '../../ai/privileged';
 import { estimateTokens } from '../../ai/pricing';
@@ -53,22 +58,63 @@ export const webExtractPayloadSchema = z
   .strict();
 
 /**
- * Raised when a control stopped the job before any provider was contacted.
+ * Every reason web.extract can be blocked, as a distinct machine token.
+ *
+ * These reach `jobs.last_error`, the `job.blocked` event payload and the
+ * operator's screen, and each one needs a different human response — so one
+ * generic "blocked" would be useless:
+ *
+ *   model_calls_disabled   MODEL_CALLS_ENABLED is not set and the configured
+ *                          provider spends money. Set the switch.
+ *   provider_unconfigured  No provider is registered under MODEL_PROVIDER.
+ *                          Record the Day 6 decision and configure it.
+ *   budget_hard_stop       The §16 ceiling. Raise it, or wait for the month.
+ *   missing_pricing        No model_pricing row in force. Add the price.
+ *   reservation_in_flight  A reservation for this exact work already exists and
+ *                          its outcome is unknown. Reconcile it against the
+ *                          provider's billing; do not retry.
+ *   security_refusal       A §8 control refused the input itself.
+ */
+export type ExtractBlockedReason =
+  | 'model_calls_disabled'
+  | 'provider_unconfigured'
+  | RefusalReason
+  | 'security_refusal';
+
+/**
+ * Raised when a control stopped the job before any provider was contacted, or
+ * before its result could be believed.
  *
  * A ControlRefusal, so the worker loop moves the job to blocked — terminal and
- * alerting (§6) — rather than retrying it. None of the three reasons improves
- * by being tried again: the ceiling is still the ceiling, the price is still
- * missing, and the switch is still off.
+ * alerting (§6) — rather than retrying it. None of these improves by being
+ * tried again: the ceiling is still the ceiling, the price is still missing,
+ * the switch is still off, and an ambiguous charge is still ambiguous.
  */
 export class ExtractBlocked extends ControlRefusal {
   override readonly name = 'ExtractBlocked';
 
   constructor(
-    override readonly reason: 'hard_stop' | 'no_pricing' | 'model_calls_disabled',
+    override readonly reason: ExtractBlockedReason,
     detail: string,
   ) {
     super(reason, detail);
   }
+}
+
+/**
+ * The identity of one unit of extraction work.
+ *
+ * Snapshot, schema version, extractor model and request identity — exactly what
+ * the review asked for, as one unique string. Two workers that compute this key
+ * cannot both reach the provider, because `llm_calls.reservation_key` is unique
+ * while it is set.
+ */
+export function reservationKeyFor(
+  snapshotId: string,
+  model: string,
+  requestHash: string,
+): string {
+  return `web.extract:${snapshotId}:${EXTRACTION_SCHEMA_VERSION}:${model}:${requestHash}`;
 }
 
 export interface WebExtractDeps {
@@ -232,55 +278,99 @@ export async function handleWebExtract(
   if (deps.provider.billable && !deps.modelCallsEnabled) {
     throw new ExtractBlocked(
       'model_calls_disabled',
-      `provider "${deps.provider.id}" is billable and MODEL_CALLS_ENABLED is not set`,
+      `provider "${deps.provider.id}" is billable and MODEL_CALLS_ENABLED is ` +
+        'not set, so no real call may be made',
     );
   }
 
-  const budget = await checkBudget(deps.pool, {
+  // --- the atomic reservation: check and claim in one act (§16) ---
+  //
+  // Committed spend plus everything in flight is compared with the ceiling
+  // inside a transaction holding the month's budgets row, and the row that
+  // claims this work is inserted in the same transaction. Two workers cannot
+  // both pass, and nothing reaches a provider without a row that already counts
+  // against the month.
+  const requestHash = requestHashFor(text);
+  const reservationKey = reservationKeyFor(snapshot.id, deps.provider.model, requestHash);
+
+  const reservation = await reserveCall(deps.pool, {
+    reservationKey,
+    traceId: job.trace_id,
+    jobId: job.id,
+    purpose: 'web.extract',
+    isolation: 'isolated_untrusted',
     provider: deps.provider.id,
     model: deps.provider.model,
     estimatedInputTokens: estimateTokens(text),
     maxOutputTokens: MAX_OUTPUT_TOKENS,
-    traceId: job.trace_id,
+    requestHash,
   });
 
-  if (!budget.allowed) {
-    // §16: the job moves to blocked and raises an alert *without contacting the
-    // provider*. The refusal is recorded as an llm_calls row with status
-    // blocked and zero cost, so the audit trail shows the control firing rather
-    // than a gap where a call would have been.
-    await recordCall(deps.pool, {
-      traceId: job.trace_id,
-      jobId: job.id,
-      purpose: 'web.extract',
-      isolation: 'isolated_untrusted',
-      provider: deps.provider.id,
-      model: deps.provider.model,
-      usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
-      latencyMs: null,
-      status: 'blocked',
-      requestHash: requestHashFor(text),
-      costUsdOverride: 0,
-    });
+  if (reservation.kind === 'refused') {
+    if (reservation.reason !== 'reservation_in_flight') {
+      // The control fired before anything was claimed, so the refusal is
+      // recorded at zero cost and without a key: it must not consume budget,
+      // and it must not block the work once the cause is fixed.
+      await recordRefusal(deps.pool, {
+        traceId: job.trace_id,
+        jobId: job.id,
+        purpose: 'web.extract',
+        isolation: 'isolated_untrusted',
+        provider: deps.provider.id,
+        model: deps.provider.model,
+        requestHash,
+        reason: reservation.reason,
+      });
+    }
+
     log.error(
       {
         snapshot_id: snapshot.id,
-        reason: budget.reason,
-        month_to_date_usd: budget.window.monthToDateUsd,
-        hard_stop_usd: budget.window.hardStopUsd,
-        estimated_usd: budget.estimatedUsd,
+        reason: reservation.reason,
+        month_to_date_usd: reservation.window.monthToDateUsd,
+        hard_stop_usd: reservation.window.hardStopUsd,
+        estimated_usd: reservation.estimatedUsd,
+        existing_call_id: reservation.existingCallId,
+        existing_status: reservation.existingStatus,
       },
       'ALERT: the budget gate refused a model call',
     );
-    throw new ExtractBlocked(budget.reason, budget.detail);
+    throw new ExtractBlocked(reservation.reason, reservation.detail);
   }
 
-  // The one step that sees page content.
-  const result = await isolatedExtract(deps.provider, {
-    text,
-    sourceUrl: snapshot.url,
-    traceId: job.trace_id,
-  });
+  // Past this line the reservation exists and the budget is already committed
+  // to it. Every path from here either finalises it or deliberately leaves it
+  // standing for a human — never silently releases it.
+  let result: Awaited<ReturnType<typeof isolatedExtract>>;
+  try {
+    // The one step that sees page content.
+    result = await isolatedExtract(deps.provider, {
+      text,
+      sourceUrl: snapshot.url,
+      traceId: job.trace_id,
+    });
+  } catch (error) {
+    // The provider may or may not have billed us: a timeout can arrive after
+    // the work was done. The reservation stays `reserved`, so its pessimistic
+    // cost keeps counting and this work cannot be retried against the provider
+    // until a human has checked the billing (§16, review item 1).
+    log.error(
+      {
+        snapshot_id: snapshot.id,
+        call_id: reservation.callId,
+        reservation_key: reservationKey,
+        err: error,
+      },
+      'ALERT: the provider call failed after its reservation was taken; the ' +
+        'reservation is left open for reconciliation and will not be replayed',
+    );
+    throw new ExtractBlocked(
+      'reservation_in_flight',
+      `the provider call failed after llm_calls ${reservation.callId} was ` +
+        'reserved, so whether it was charged is unknown. Reconcile it with ' +
+        'ops/day4-reservations before re-enqueueing this snapshot.',
+    );
+  }
 
   const stored = result.valid && result.extraction !== undefined
     ? extractionPayloadSchema.parse({
@@ -325,17 +415,14 @@ export async function handleWebExtract(
       inserted.rows[0]?.id ??
       ((await findExtraction(client, snapshot.id, deps.provider.model)) as string);
 
-    await recordCall(client, {
-      traceId: job.trace_id,
-      jobId: job.id,
-      purpose: 'web.extract',
-      isolation: 'isolated_untrusted',
-      provider: deps.provider.id,
-      model: deps.provider.model,
+    // The reservation becomes the record of what actually happened, in the
+    // same transaction as the fact it produced: a charge never exists without
+    // its fact, and a fact never exists without its charge.
+    await finalizeCall(client, {
+      callId: reservation.callId,
       usage: result.usage,
       latencyMs: result.latencyMs,
       status: result.valid ? 'succeeded' : 'failed',
-      requestHash: result.requestHash,
     });
 
     await client.query(

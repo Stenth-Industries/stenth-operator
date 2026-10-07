@@ -188,9 +188,21 @@ describe('permission and provenance', () => {
       'https://smithlegal.com.au.evil.test/',
       'https://notsmithlegal.com.au/',
       'https://smithlegal.com/',
-      'https://sub.www.smithlegal.com.au/',
     ]) {
       expect(isOnOwnDomain(url, 'smithlegal.com.au'), url).toBe(false);
+    }
+  });
+
+  it('accepts a legitimate subdomain, however deep', () => {
+    // The Day 5 policy: first-party evidence may sit anywhere on the firm's own
+    // registrable domain. The earlier host-equality rule refused this, which
+    // would have dropped a firm whose content lives on a state subdomain.
+    for (const url of [
+      'https://nsw.smithlegal.com.au/',
+      'https://sub.www.smithlegal.com.au/',
+      'https://criminal.vic.smithlegal.com.au/about',
+    ]) {
+      expect(isOnOwnDomain(url, 'smithlegal.com.au'), url).toBe(true);
     }
   });
 

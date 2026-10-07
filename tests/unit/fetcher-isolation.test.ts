@@ -152,7 +152,18 @@ describe('GATE 18: the fetcher holds no model or mail credential (§8, §17)', (
     // Structural, not a comment: the service stops rather than running with a
     // credential it must not have.
     const server = readFileSync(join(root, 'src', 'fetcher', 'server.ts'), 'utf8');
-    expect(server).toContain('MODEL_API_KEY is present in the fetcher environment');
+    // Every model credential, not just the one name: a new vendor key that
+    // nobody added to the config schema would be invisible to a config-shaped
+    // check, and this is the process §8 assumes will be compromised.
+    expect(server).toContain('is present in the fetcher environment');
+    for (const variable of [
+      'MODEL_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'GOOGLE_API_KEY',
+    ]) {
+      expect(server, variable).toContain(variable);
+    }
   });
 
   it('imports nothing that could send mail or call a model', () => {

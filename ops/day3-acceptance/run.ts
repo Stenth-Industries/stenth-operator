@@ -81,7 +81,7 @@ const seedSchema = z.object({
 type Site = z.infer<typeof siteSchema>;
 
 interface Options {
-  readonly mode: 'plan' | 'enqueue' | 'reserve' | 'report';
+  readonly mode: 'plan' | 'enqueue' | 'reserve' | 'report' | 'refetch-signals';
   readonly only: readonly string[];
   readonly batch: number;
   readonly staggerSeconds: number;
@@ -98,8 +98,16 @@ function parseArgs(argv: readonly string[]): Options {
     return hit?.slice(name.length + 3);
   };
   const mode = positional[0] ?? 'plan';
-  if (mode !== 'plan' && mode !== 'enqueue' && mode !== 'reserve' && mode !== 'report') {
-    throw new Error(`unknown mode "${mode}": expected plan, enqueue, reserve or report`);
+  if (
+    mode !== 'plan' &&
+    mode !== 'enqueue' &&
+    mode !== 'reserve' &&
+    mode !== 'report' &&
+    mode !== 'refetch-signals'
+  ) {
+    throw new Error(
+      `unknown mode "${mode}": expected plan, enqueue, reserve, report or refetch-signals`,
+    );
   }
 
   const stagger = Number(flag('stagger-seconds') ?? '30');
@@ -454,6 +462,177 @@ async function runReserve(pool: Pool, reserve: readonly Site[], options: Options
   );
 }
 
+/**
+ * The controlled Tier A re-fetch (review item 3).
+ *
+ * The 20 accepted snapshots predate the scanner, so their `signals` is NULL and
+ * extraction records Tier A as `unknown`. This asks the fetcher for each firm's
+ * homepage once more, so migration 006's deterministic scan lands.
+ *
+ * Scoped from the database, not from a list: the firms with usable 2xx evidence
+ * and no scan. A firm that was never accepted is not touched, and a firm that
+ * already has a scan is not asked again.
+ *
+ * Everything else is the Day 3 path unchanged — the same worker, the same
+ * fetcher, the same robots, politeness and SSRF controls, one homepage per
+ * firm, 30 seconds apart, one attempt. No model is called: the scan is regular
+ * expressions over markup. A refusal is a refusal; nothing is retried around.
+ *
+ * Re-fetching unchanged bytes used to be a no-op that left the NULL in place.
+ * Migration 008 makes the conflict fill `signals` in when it is missing, with a
+ * column-level UPDATE grant and only from NULL — so this run works whether or
+ * not a firm has touched its website since Day 3.
+ */
+async function runRefetchSignals(pool: Pool, options: Options): Promise<void> {
+  const { rows } = await pool.query<{
+    id: string;
+    canonical_domain: string;
+    legal_name: string | null;
+    url: string;
+  }>(
+    `SELECT DISTINCT ON (c.canonical_domain)
+            c.id, c.canonical_domain::text AS canonical_domain, c.legal_name, s.url
+       FROM usable_snapshots s
+       JOIN web_snapshots w ON w.id = s.id
+       JOIN companies c ON c.id = s.company_id
+      WHERE length(s.text) >= $1
+        AND w.signals IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM web_snapshots w
+           WHERE w.company_id = c.id AND w.signals IS NOT NULL
+        )
+      ORDER BY c.canonical_domain, s.fetched_at DESC`,
+    [USABLE_TEXT_CHARS],
+  );
+
+  if (rows.length === 0) {
+    console.log('Every accepted firm already has a Tier A scan. Nothing to re-fetch.');
+    return;
+  }
+
+  console.log(`accepted firms with no Tier A scan: ${rows.length}`);
+  console.log(
+    `       one homepage each, ${options.staggerSeconds}s apart, ` +
+      `max_attempts ${options.maxAttempts}, priority ${ACCEPTANCE_PRIORITY}`,
+  );
+  console.log(
+    `       outbound: ${rows.length} robots.txt + ${rows.length} pages = ` +
+      `${rows.length * 2} requests, one host at a time. No model calls.`,
+  );
+  console.log('');
+
+  if (!options.confirmed) {
+    for (const [index, row] of rows.entries()) {
+      console.log(
+        ` ${String(index + 1).padStart(2)}  ${row.canonical_domain.padEnd(36)} would re-fetch ` +
+          `${`https://${row.canonical_domain}/`}`,
+      );
+    }
+    console.log('');
+    console.log('Nothing was written. Re-run with: refetch-signals --yes');
+    return;
+  }
+
+  const startedAt = Date.now();
+  let enqueued = 0;
+  for (const [index, row] of rows.entries()) {
+    const urls = [`https://${row.canonical_domain}/`];
+    // A fresh occurrence, so §7's per-occurrence key does not collide with the
+    // original acceptance run's job for the same page.
+    const key = keyFor(row.id, urls, `${options.occurrence}-signals`);
+    const traceId = newTraceId();
+    const runAfter = new Date(startedAt + index * options.staggerSeconds * 1000);
+
+    const result = await enqueue(pool, {
+      kind: 'web.fetch',
+      dedupeKey: key,
+      traceId,
+      payload: { company_id: row.id, urls },
+      priority: ACCEPTANCE_PRIORITY,
+      runAfter,
+      maxAttempts: options.maxAttempts,
+    });
+    if (result.inserted) {
+      enqueued += 1;
+    }
+    console.log(
+      ` ${String(index + 1).padStart(2)}  ${row.canonical_domain.padEnd(36)} ` +
+        `${result.inserted ? 'enqueued      ' : 'deduplicated  '} ` +
+        `runs at ${runAfter.toISOString()}  trace ${traceId}`,
+    );
+  }
+
+  console.log('');
+  console.log(`jobs enqueued ${enqueued} of ${rows.length}`);
+  console.log('Then: report --signals');
+}
+
+/** The Tier A table, read-only, after a re-fetch. */
+async function printSignalsReport(pool: Pool): Promise<void> {
+  const { rows } = await pool.query<{
+    canonical_domain: string;
+    legal_name: string | null;
+    signals: Record<string, unknown> | null;
+  }>(
+    `SELECT DISTINCT ON (c.canonical_domain)
+            c.canonical_domain::text AS canonical_domain, c.legal_name, w.signals
+       FROM usable_snapshots s
+       JOIN web_snapshots w ON w.id = s.id
+       JOIN companies c ON c.id = s.company_id
+      WHERE length(s.text) >= $1
+      ORDER BY c.canonical_domain, (w.signals IS NULL), s.fetched_at DESC`,
+    [USABLE_TEXT_CHARS],
+  );
+
+  const header = [
+    'domain'.padEnd(36),
+    'AW'.padEnd(5),
+    'GA4'.padEnd(5),
+    'GTM'.padEnd(5),
+    'call'.padEnd(6),
+    'tel'.padEnd(5),
+    'form'.padEnd(6),
+    'vport'.padEnd(7),
+    'locs'.padEnd(6),
+    'year',
+  ].join(' ');
+  console.log('');
+  console.log(header);
+  console.log('-'.repeat(header.length));
+
+  const mark = (value: unknown): string =>
+    value === true ? 'yes' : value === false ? 'no' : '-';
+
+  let scanned = 0;
+  for (const row of rows) {
+    const signals = row.signals;
+    if (signals !== null) {
+      scanned += 1;
+    }
+    console.log(
+      [
+        row.canonical_domain.padEnd(36),
+        mark(signals?.paid_search_tag).padEnd(5),
+        mark(signals?.ga4).padEnd(5),
+        mark(signals?.gtm).padEnd(5),
+        mark(signals?.call_tracking).padEnd(6),
+        mark(signals?.tel_link).padEnd(5),
+        mark(signals?.form_present).padEnd(6),
+        mark(signals?.viewport_meta).padEnd(7),
+        String(signals?.location_page_links ?? '-').padEnd(6),
+        String(signals?.copyright_year ?? '-'),
+      ].join(' '),
+    );
+  }
+
+  console.log('');
+  console.log(`scanned: ${scanned} of ${rows.length} accepted firms`);
+  console.log(
+    'A dash means no scanner has looked, which extraction records as unknown — ' +
+      'never as absent, because §10 pays for absence.',
+  );
+}
+
 interface ReportRow {
   readonly site: Site;
   readonly company_id: string | null;
@@ -703,6 +882,14 @@ async function main(): Promise<void> {
     }
     if (options.mode === 'reserve') {
       await runReserve(pool, seed.reserve, options);
+      return;
+    }
+    if (options.mode === 'refetch-signals') {
+      await runRefetchSignals(pool, options);
+      return;
+    }
+    if (process.argv.includes('--signals')) {
+      await printSignalsReport(pool);
       return;
     }
 
