@@ -1,15 +1,21 @@
 # Day 3 acceptance run — 16 real law-firm sites
 
 SPEC.md §25 exits Day 3 on **20 real law-firm sites fetched and stored**. Five
-have been attempted on the VPS: four returned 200, one (Doogue + George) returned
-403. This directory takes the remaining sixteen through the same path.
+have been attempted on the VPS: four are accepted, one (Doogue + George)
+returned 403. This directory takes sixteen more through the same path, with nine
+verified reserves held back for a shortfall.
 
 | File | What it is |
 |---|---|
-| `sites.json` | The sixteen firms, with the evidence URL each name and domain came from. **Review this first.** |
-| `run.ts` | `plan` (writes nothing), `enqueue`, `report`. |
-| `verify.sql` | Eleven read-only queries. SELECT only — no INSERT, UPDATE, DELETE or DDL. |
-| `findings.md` | The 403 question, answered against the frozen spec, plus one other finding. No code was changed. |
+| `sites.json` | 16 primaries + 9 reserves, each with the evidence URL its name and domain came from. **Review this first.** |
+| `run.ts` | `plan` (writes nothing), `enqueue`, `reserve`, `report`. |
+| `verify.sql` | Thirteen read-only queries. SELECT only — no INSERT, UPDATE, DELETE or DDL. |
+| `findings.md` | Finding 1 (error pages stored as evidence): **fixed**, with what changed. Finding 2 (off-domain redirects): open by decision, reported and not filtered. |
+
+**Counts.** 4 accepted already + 16 primaries = 20 if every primary is accepted.
+Realistically some are refused, which is what the 9 reserves are for. The
+reserves are never fetched as a matter of course: `reserve` refuses to run once
+the accepted count reaches 20, and caps each batch at the size of the shortfall.
 
 **What the script does not do.** It opens no socket to the public internet: it
 inserts companies and enqueues `web.fetch` jobs, and the running worker and the
@@ -41,6 +47,29 @@ is the VPS, through the fetcher.
 
 Run everything from `/opt/stenth-operator`. Nothing here touches `/opt/stenth`,
 Caddy, or any existing container, and nothing publishes a port.
+
+### B0. This release needs a migration
+
+The commit that carries this harness also carries the finding 1 fix, which
+includes **migration 005** (the `web_snapshots` text-requires-2xx constraint and
+the `usable_snapshots` view) and a change to `bootstrap`. The acceptance run
+depends on both: `verify.sql` and `run.ts report` read `usable_snapshots`.
+
+So this is a normal deploy first, then the acceptance run — never both in one
+step, because you want to know which one caused a surprise:
+
+```bash
+cd /opt/stenth-operator
+docker compose --profile migrate build
+docker compose run --rm migrate
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker compose ps
+```
+
+`ADMIN_DATABASE_URL` must be the bootstrap superuser — see the note under "The
+database roles" in `ops/deploy.md`. The migration is additive: it adds a
+constraint `NOT VALID` and creates a view. It deletes nothing, and the
+historical 403 snapshot is deliberately kept.
 
 ### B1. Get the commit and confirm the stack is healthy
 
@@ -154,6 +183,35 @@ docker compose exec -T postgres psql -U postgres -d operator -f - \
 `psql` here connects over the container's local socket as `postgres`, so no
 password is typed and no secret is read. Every statement in the file is a SELECT.
 
+### B6. Only if short of 20: one reserve batch
+
+```bash
+docker compose run --rm --no-deps \
+  -e SERVICE_NAME=day3-acceptance \
+  -v /opt/stenth-operator/ops:/app/ops:ro \
+  worker node --import tsx /app/ops/day3-acceptance/run.ts reserve
+```
+
+That is a dry run: it prints the accepted count, the shortfall and which
+reserves it would take. Add `--yes` to enqueue them. Three brakes, and they are
+the point of the mode:
+
+1. It **refuses entirely** once the accepted count has reached 20.
+2. The batch is capped at the **size of the shortfall**, so at 19 of 20 it sends
+   one request, not nine. `--batch=N` (default 4, max 9) only lowers the cap
+   further.
+3. A reserve this harness has already enqueued is **never enqueued again**,
+   whatever its outcome. A site that answered 403 is not asked twice.
+
+The accepted count it gates on is database-wide, read from `usable_snapshots`,
+so the four firms accepted before this harness existed count toward it — as they
+should.
+
+Run `report` after each batch. Come back here only if there is still a
+shortfall, and if the reserves run out, verify a further real firm and add it to
+`sites.json` with its `evidence_url` rather than re-asking a site that already
+answered.
+
 ---
 
 ## C. Expected results
@@ -175,7 +233,12 @@ stored, any error, and whether it counts.
 - a snapshot row exists,
 - `http_status` is 200–299,
 - `robots_allowed` is true,
-- extracted text is **at least 500 characters**.
+- extracted text is **at least 500 characters**,
+- and the firm is counted **once**, however many snapshots it has.
+
+The first three are the `usable_snapshots` view (migration 005), so the rule has
+one definition in the system rather than one per query. The 500-character floor
+is the acceptance threshold on top of it.
 
 500 is the stated floor between a real homepage (thousands to tens of thousands
 of characters) and an error page, a parked domain or a JavaScript-only shell (a
@@ -185,10 +248,14 @@ reproducible rather than a judgement call.
 **Realistic outcome, stated honestly.** One of the five sites already attempted
 returned 403 — bot protection in front of a law-firm site is common, not
 exceptional. On that rate, expect roughly **11 to 14 of the 16** to count, giving
-**15 to 18 of 20** overall. The 20-site criterion may therefore need the reserve
-entry in `sites.json` and a further verified batch. That is a normal result for a
-real-world fetch test and is not a fetcher defect — but **do not** report Day 3
-complete at 15 or 18. The criterion is 20.
+**15 to 18 of 20** overall, and one or two reserve batches to close the gap. That
+is a normal result for a real-world fetch test, not a fetcher defect — but **do
+not** report Day 3 complete at 15 or 18. The criterion is 20.
+
+**A 403 now looks different.** The site is asked once, a diagnostic row is
+written with `text` NULL, the job completes rather than retrying, and
+`report` lists it under "answered with an error status". That is the finding 1
+fix working; it is not a regression.
 
 **What must not change.** Zero model calls and zero spend (`llm_calls` stays 0 —
 no model API key exists in this deployment yet). No new rows in `extractions`,
@@ -204,11 +271,13 @@ in `/opt/stenth` touched.
 
 ## D. Read-only SQL verification
 
-`ops/day3-acceptance/verify.sql`, run as shown in B5. Eleven queries: the
-acceptance count, the per-site table, **snapshots stored with an error status**
-(should be empty — see `findings.md`), job outcomes, dead/blocked jobs, robots
-decisions, the robots cache, the duplicate guards, proof that no downstream table
-moved, scheduler liveness and spend, and the off-domain-redirect check.
+`ops/day3-acceptance/verify.sql`, run as shown in B5. Thirteen queries: the
+acceptance count against the target of 20, the per-site table, **error-status
+rows with `text_length` expected NULL on every one**, job outcomes, dead/blocked
+jobs, robots decisions, the robots cache, the duplicate guards, proof that no
+downstream table moved, scheduler liveness and spend, the off-domain-redirect
+check, the installed non-2xx constraint, and proof that the fetcher role cannot
+read the evidence view.
 
 ---
 
@@ -220,8 +289,10 @@ Read `jobs.last_error` and the trace id from the report, then
 
 | What you see | What it means | What to do |
 |---|---|---|
-| `http_status` 403 or 401, snapshot stored | The site refuses automated clients. | Nothing. It does not count. **Do not** change the User-Agent, add headers, use a proxy or retry around it — requirement 9, and §8's identity rule exists to be honest about who we are. Record it and move on. |
-| `http_status` 429 | Rate limited. | Stop that host. One request per host per run means it is not our volume; it is a blanket policy. Treat as 403. |
+| `http_status` 401/403/404, job succeeded | The site answered, and the answer is no. Terminal: one request, text NULL, not retried. | Nothing. It does not count. **Do not** change the User-Agent, add headers, use a proxy or retry around it — requirement 9, and §8's identity rule exists to be honest about who we are. |
+| `http_status` 429 | Rate limited. Treated exactly as a 403: terminal, one request. | Nothing, and specifically do not re-run that site. One request per host per run means it is not our volume; it is a blanket policy. |
+| job `dead`, `last_error` mentions `http_status_50x` | The site gave no answer. §6's bounded retry ran out. | Expected behaviour for a site that is down. Re-run that one site later with `--only=<domain> --occurrence=<a later date>` if you want to. |
+| `OFF-DOMAIN FINAL URL` in the report | A redirect left the firm's domain (finding 2). apex → `www` is filtered out of this list, so anything here is a real domain change. | Look at it by hand. Day 4 must not consume it as company evidence until the policy is resolved. Do not add a filter. |
 | `robots_allowed = false`, no `http_status`, `text` NULL | §8 working: `Disallow` matched, nothing was fetched. | Nothing. It does not count, and it is never overridden. |
 | job `dead`, `last_error` mentions `robots_http_5xx` / `robots_unavailable` | robots.txt gave no answer, so permission was never granted and the page was skipped. Correct and deliberate. | Re-run that one site later: `--only=<domain> --occurrence=<a later date>`. Or `--max-attempts=3` to let §6's backoff handle it. |
 | `last_error` with `address_blocked`, `content_type_not_allowed`, `too_many_redirects`, `timeout`, `transport_error` | A §8 control fired. `address_blocked` means the host resolved into a private range — exclude that site and say so. | Nothing to fix in the Operator. Record the refusal. |
@@ -253,8 +324,15 @@ SELECT id, canonical_domain, legal_name, created_at FROM companies
 
 ## F. Findings
 
-See `findings.md`. In short: the 403-stored-as-succeeded behaviour is **not
-compliant in effect** and needs a correction in the fetcher before Day 4 builds
-`web.extract`; §8's hardening table is simply silent on status codes, so it is a
-gap rather than a broken rule. A second, lower-severity finding covers redirects
-that leave the firm's own domain. **No application code was changed.**
+See `findings.md`.
+
+**Finding 1 — fixed.** A non-2xx response can no longer become evidence: the
+body is dropped at the edge, a 4xx is stored with `text` NULL and is terminal, a
+5xx stores nothing and retries within §6's budget, the contract declares which
+outcomes are retryable, and migration 005 makes the row shape a database
+constraint. Regression tests cover 401, 403, 404, 429, 500, 503, 2xx and robots.
+
+**Finding 2 — open by decision.** Off-domain final URLs are reported and
+explicitly flagged, by `run.ts report` and by `verify.sql` query 11. No
+registrable-domain policy is implemented. Day 4 must not consume an off-domain
+snapshot as company evidence until it is resolved.

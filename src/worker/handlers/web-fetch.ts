@@ -12,7 +12,13 @@
  */
 import { z } from 'zod';
 
-import { AUTH_HEADER, fetchResponseSchema, type FetchResponse } from '../../fetcher/contract';
+import {
+  AUTH_HEADER,
+  EXTRACTABLE_OUTCOMES,
+  fetchResponseSchema,
+  isRetryable,
+  type FetchResponse,
+} from '../../fetcher/contract';
 import type { ClaimedJob } from '../../jobs/queue';
 import { withTrace } from '../../obs/log';
 import { TRACE_HEADER } from '../../obs/trace';
@@ -35,10 +41,26 @@ export interface WebFetchDeps {
 }
 
 export interface WebFetchResult {
+  /** 2xx pages whose text was stored. The only source of research evidence. */
   readonly stored: number;
   readonly robotsDisallowed: number;
+  /** 4xx: the site answered no. Terminal, so it never causes a retry. */
+  readonly httpError: number;
+  /** 5xx and the like: no answer, so another attempt is legitimate. */
+  readonly httpUnavailable: number;
+  /** A §8 guard refusal. Retryable, as before. */
   readonly refused: number;
-  readonly snapshotIds: readonly string[];
+  /**
+   * Snapshots that carry page text and so may be extracted.
+   *
+   * Deliberately not "every snapshot this job touched". A robots-disallowed row
+   * and a 4xx row both exist in web_snapshots and both have text NULL; neither
+   * belongs in the list Day 4 will iterate to enqueue web.extract. Keeping them
+   * out of this list is the first of three layers that stop a non-page becoming
+   * evidence — the other two are text being NULL and the CHECK constraint in
+   * migration 005.
+   */
+  readonly extractableSnapshotIds: readonly string[];
 }
 
 /**
@@ -87,8 +109,11 @@ export async function handleWebFetch(
 
   let stored = 0;
   let robotsDisallowed = 0;
+  let httpError = 0;
+  let httpUnavailable = 0;
   let refused = 0;
-  const snapshotIds: string[] = [];
+  let retryable = 0;
+  const extractableSnapshotIds: string[] = [];
 
   for (const url of payload.urls) {
     const result = await requestOne(deps, {
@@ -97,34 +122,69 @@ export async function handleWebFetch(
       trace_id: job.trace_id,
     });
 
-    if (result.outcome === 'stored') {
-      stored += 1;
-      if (result.snapshot_id !== undefined) {
-        snapshotIds.push(result.snapshot_id);
-      }
-    } else if (result.outcome === 'robots_disallowed') {
-      robotsDisallowed += 1;
-      if (result.snapshot_id !== undefined) {
-        snapshotIds.push(result.snapshot_id);
-      }
-    } else {
-      refused += 1;
-      // A refusal is the guard working. It is recorded, not retried blindly:
-      // the job's own retry budget decides whether the page is tried again.
-      log.warn({ url, reason: result.reason }, 'fetcher refused a page');
+    if (isRetryable(result.outcome)) {
+      retryable += 1;
+    }
+
+    switch (result.outcome) {
+      case 'stored':
+        stored += 1;
+        break;
+      case 'robots_disallowed':
+        robotsDisallowed += 1;
+        break;
+      case 'http_error':
+        httpError += 1;
+        // Terminal. Logged, recorded by the fetcher as a text-free row, and
+        // deliberately not a reason to run the job again: a site that answered
+        // 403 answers 403 the next two times as well, and asking it is three
+        // unwanted requests at a site that has already said no.
+        log.warn({ url, reason: result.reason }, 'the site refused the page; not retrying it');
+        break;
+      case 'http_unavailable':
+        httpUnavailable += 1;
+        log.warn({ url, reason: result.reason }, 'the site gave no answer; the job may retry');
+        break;
+      default:
+        refused += 1;
+        // A refusal is the guard working. It is recorded, not retried blindly:
+        // the job's own retry budget decides whether the page is tried again.
+        log.warn({ url, reason: result.reason }, 'fetcher refused a page');
+    }
+
+    if (
+      result.snapshot_id !== undefined &&
+      EXTRACTABLE_OUTCOMES.includes(result.outcome)
+    ) {
+      extractableSnapshotIds.push(result.snapshot_id);
     }
   }
 
   log.info(
-    { company_id: payload.company_id, stored, robots_disallowed: robotsDisallowed, refused },
+    {
+      company_id: payload.company_id,
+      stored,
+      robots_disallowed: robotsDisallowed,
+      http_error: httpError,
+      http_unavailable: httpUnavailable,
+      refused,
+    },
     'web.fetch complete',
   );
 
-  // Every page refused is a failed attempt: the job retries with backoff and
-  // eventually goes dead rather than silently succeeding with nothing.
-  if (stored === 0 && robotsDisallowed === 0) {
-    throw new Error(`every page was refused for company ${payload.company_id}`);
+  // Retry only when retrying could change the answer.
+  //
+  // A failed attempt means the job goes back to queued with backoff and
+  // eventually dead, which is right when the failure was transient — a 5xx, a
+  // timeout, a guard refusal that may not recur. It is wrong when every page
+  // ended in a terminal state: a job whose only page returned 404 has its
+  // answer, and throwing here would turn one unwanted request into three.
+  if (stored === 0 && robotsDisallowed === 0 && retryable > 0) {
+    throw new Error(
+      `no page could be fetched for company ${payload.company_id}: ` +
+        `${refused} refused, ${httpUnavailable} unavailable`,
+    );
   }
 
-  return { stored, robotsDisallowed, refused, snapshotIds };
+  return { stored, robotsDisallowed, httpError, httpUnavailable, refused, extractableSnapshotIds };
 }

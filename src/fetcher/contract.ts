@@ -34,12 +34,64 @@ export const fetchRequestSchema = z
 
 export type FetchRequest = z.infer<typeof fetchRequestSchema>;
 
-/** Why a fetch produced no snapshot. Mirrors FetchRefusal plus robots. */
+/**
+ * What the fetch resolved to, and — just as important — whether asking again
+ * could change the answer.
+ *
+ *   stored            2xx. Text was extracted and written. The only outcome
+ *                     that produces research evidence.
+ *   robots_disallowed A Disallow matched. The decision is recorded as a
+ *                     text-free row; nothing was fetched (§8).
+ *   http_error        4xx. The site answered, and the answer is no. Terminal:
+ *                     a 403 or a 404 does not become a 200 by asking twice
+ *                     more, and asking twice more is three unwanted requests
+ *                     at a site that has already refused us. A diagnostic
+ *                     row is written with text NULL.
+ *   http_unavailable  5xx, or any other status that is neither 2xx nor 4xx.
+ *                     No answer was given, so another attempt is legitimate.
+ *                     Retryable, and no row is written.
+ *   refused           A §8 guard refused the request. Retryable, as before.
+ *
+ * The terminal/retryable split lives here, in the contract, rather than in the
+ * handler: the two sides have to agree on which failures are worth another
+ * attempt, and that agreement is the thing a future change is most likely to
+ * break quietly.
+ */
 export const fetchOutcomeSchema = z.enum([
   'stored',
   'robots_disallowed',
+  'http_error',
+  'http_unavailable',
   'refused',
 ]);
+
+export type FetchOutcome = z.infer<typeof fetchOutcomeSchema>;
+
+/** Final: this job will not ask for the page again. */
+export const TERMINAL_OUTCOMES: readonly FetchOutcome[] = [
+  'stored',
+  'robots_disallowed',
+  'http_error',
+];
+
+/** Worth another attempt inside the job's §6 retry budget. */
+export const RETRYABLE_OUTCOMES: readonly FetchOutcome[] = [
+  'http_unavailable',
+  'refused',
+];
+
+export function isRetryable(outcome: FetchOutcome): boolean {
+  return RETRYABLE_OUTCOMES.includes(outcome);
+}
+
+/**
+ * The outcomes whose snapshot carries page text, and so may be extracted.
+ *
+ * One entry today. It is a named list rather than an `=== 'stored'` because
+ * Day 4 reads it to decide what to enqueue, and the question "may this row
+ * become evidence?" must have exactly one answer in the codebase.
+ */
+export const EXTRACTABLE_OUTCOMES: readonly FetchOutcome[] = ['stored'];
 
 export const fetchResponseSchema = z
   .object({
@@ -68,7 +120,25 @@ export const fetchResponseSchema = z
       .optional(),
     trace_id: z.string().max(64),
   })
-  .strict();
+  .strict()
+  .superRefine((response, ctx) => {
+    // Only a 2xx fetch has content, so only 'stored' may describe content. A
+    // reply that claimed a text_length for a 403 would be rejected at the
+    // boundary rather than believed — which is what keeps an error page from
+    // ever looking like evidence to the worker.
+    if (response.outcome === 'stored') {
+      return;
+    }
+    for (const field of ['content_hash', 'text_length'] as const) {
+      if (response[field] !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: `${field} is only meaningful for outcome "stored", not "${response.outcome}"`,
+        });
+      }
+    }
+  });
 
 export type FetchResponse = z.infer<typeof fetchResponseSchema>;
 

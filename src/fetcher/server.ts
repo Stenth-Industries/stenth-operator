@@ -258,6 +258,70 @@ export async function fetchAndStore(
     throw error;
   }
 
+  // --- what came back decides whether it is evidence at all ---
+  //
+  // §9's Tier A signals are observations of the firm's own public site, read
+  // out of stored HTML by code. An error page is not that site, and every Tier
+  // A signal is absent from it — which is exactly what §10's Visible execution
+  // gap dimension, the largest of the five, pays for. Scored against a 403 a
+  // blocked firm would come out looking like a strong prospect, on no evidence
+  // at all. So a non-2xx response never becomes text, here, before anything
+  // downstream has a chance to read it.
+  const statusClass = classifyStatus(outcome.httpStatus);
+
+  if (statusClass === 'client_error') {
+    // 4xx: the site answered, and the answer is no. Terminal.
+    //
+    // The row is kept for the audit trail and for the acceptance report — §8
+    // already writes a text-free row to record the robots decision, and this is
+    // the same idea for a second kind of refusal. `text` is NULL, so no later
+    // stage can mistake it for a page we read, and migration 005 makes that a
+    // database constraint rather than a promise.
+    const snapshotId = await storeSnapshot(deps.pool, {
+      companyId: input.companyId,
+      url: outcome.finalUrl,
+      httpStatus: outcome.httpStatus,
+      contentHash: statusSentinelHash(outcome.httpStatus),
+      text: undefined,
+      bytes: outcome.bytes,
+      robotsAllowed: true,
+      traceId: input.traceId,
+    });
+    log.warn(
+      { url: outcome.finalUrl, http_status: outcome.httpStatus, bytes: outcome.bytes },
+      'the site refused the page; recorded with no text and not retried',
+    );
+    return {
+      outcome: 'http_error',
+      http_status: outcome.httpStatus,
+      bytes: outcome.bytes,
+      robots_allowed: true,
+      final_url: outcome.finalUrl,
+      ...(snapshotId === undefined ? {} : { snapshot_id: snapshotId }),
+      reason: `http_status_${outcome.httpStatus}`,
+      trace_id: input.traceId,
+    };
+  }
+
+  if (statusClass === 'unavailable') {
+    // 5xx, and anything else that is neither 2xx nor 4xx: no answer was given.
+    // No row — a snapshot row records a decision that is final, and this one is
+    // not — and the job's §6 retry budget decides whether to ask again.
+    log.warn(
+      { url: outcome.finalUrl, http_status: outcome.httpStatus },
+      'the site gave no answer; the job may try again',
+    );
+    return {
+      outcome: 'http_unavailable',
+      http_status: outcome.httpStatus,
+      bytes: outcome.bytes,
+      robots_allowed: true,
+      final_url: outcome.finalUrl,
+      reason: `http_status_${outcome.httpStatus}`,
+      trace_id: input.traceId,
+    };
+  }
+
   // --- untrusted content becomes text, then a row ---
   const extracted =
     outcome.contentType === 'text/plain'
@@ -303,6 +367,37 @@ export async function fetchAndStore(
 
 function hashOf(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+type StatusClass = 'success' | 'client_error' | 'unavailable';
+
+/**
+ * Three classes, because they need three different answers.
+ *
+ * Anything that is neither 2xx nor 4xx — a stray 3xx that guardedFetch did not
+ * treat as a redirect, a 1xx, a 5xx — lands in 'unavailable' and is retried
+ * within the §6 budget, then goes dead visibly. Guessing is worse than that.
+ */
+function classifyStatus(status: number): StatusClass {
+  if (status >= 200 && status < 300) {
+    return 'success';
+  }
+  if (status >= 400 && status < 500) {
+    return 'client_error';
+  }
+  return 'unavailable';
+}
+
+/**
+ * The content hash for a row that has no content.
+ *
+ * `UNIQUE (company_id, url, content_hash)` needs a value, and it must not be a
+ * hash of anything a page could produce. Deriving it from the status keeps two
+ * different refusals on one URL as two distinct rows, and keeps a re-run of the
+ * same refusal idempotent.
+ */
+function statusSentinelHash(status: number): string {
+  return hashOf(`\u0000http_status:${status}`);
 }
 
 /**

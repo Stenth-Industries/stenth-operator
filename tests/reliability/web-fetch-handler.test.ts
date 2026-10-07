@@ -9,7 +9,7 @@ import { createFetcherServer } from '../../src/fetcher/server';
 import { FROZEN_POLICY, type FetchPolicy } from '../../src/fetch/policy';
 import { HostPoliteness } from '../../src/fetch/politeness';
 import { enqueue } from '../../src/jobs/enqueue';
-import { claimJob } from '../../src/jobs/queue';
+import { claimJob, completeJob, failJob } from '../../src/jobs/queue';
 import { handleWebFetch, MAX_PAGES_PER_JOB, webFetchPayloadSchema } from '../../src/worker/handlers/web-fetch';
 import { createTestDatabase, hasDatabase, type TestDatabase } from '../helpers/testDb';
 
@@ -29,6 +29,8 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
   let originUrl: string;
   let service: Server;
   let fetcherUrl: string;
+  /** Every path the origin served, so "did not retry" can be measured. */
+  let requests: string[] = [];
 
   beforeAll(async () => {
     db = await createTestDatabase();
@@ -41,12 +43,18 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
 
     origin = createServer((request, response) => {
       const url = request.url ?? '/';
+      requests.push(url);
+      const status = /^\/status\/(\d{3})$/.exec(url);
       if (url === '/robots.txt') {
         response.writeHead(200, { 'content-type': 'text/plain' });
         response.end('User-agent: *\nDisallow: /private\n');
       } else if (url.startsWith('/private')) {
         response.writeHead(200, { 'content-type': 'text/html' });
         response.end('<p>never</p>');
+      } else if (status !== null) {
+        // A branded error page, because that is what real sites serve.
+        response.writeHead(Number(status[1]), { 'content-type': 'text/html' });
+        response.end('<html><body><h1>Access Denied</h1><p>HANDLER_ERROR_MARKER</p></body></html>');
       } else {
         response.writeHead(200, { 'content-type': 'text/html' });
         response.end(`<p>page at ${url}</p>`);
@@ -83,12 +91,13 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     return { fetcherUrl, sharedSecret: SECRET };
   }
 
-  async function claimFetchJob(urls: string[]) {
+  async function claimFetchJob(urls: string[], maxAttempts?: number) {
     await enqueue(app, {
       kind: 'web.fetch',
       dedupeKey: `fetch:${companyId}:${Math.random().toString(36).slice(2)}:2026-10-06`,
       traceId: TRACE,
       payload: { company_id: companyId, urls },
+      ...(maxAttempts === undefined ? {} : { maxAttempts }),
     });
     const job = await claimJob(app, 'test-worker');
     if (job === undefined) {
@@ -103,7 +112,7 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
 
     expect(result.stored).toBe(3);
     expect(result.refused).toBe(0);
-    expect(result.snapshotIds).toHaveLength(3);
+    expect(result.extractableSnapshotIds).toHaveLength(3);
 
     const { rows } = await db.adminPool.query<{ count: string }>(
       'SELECT count(*) AS count FROM web_snapshots WHERE company_id = $1 AND robots_allowed',
@@ -123,7 +132,7 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     // The guard refusing every page is a failed attempt, so the job retries
     // with backoff and eventually goes dead rather than succeeding with nothing.
     const job = await claimFetchJob(['http://169.254.169.254/latest/meta-data/']);
-    await expect(handleWebFetch(job, deps())).rejects.toThrow(/every page was refused/);
+    await expect(handleWebFetch(job, deps())).rejects.toThrow(/no page could be fetched/);
   }, 60_000);
 
   it('never sends the page body to the worker, only metadata', async () => {
@@ -133,7 +142,8 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     // only the privileged zone can read it.
     expect(JSON.stringify(result)).not.toContain('page at');
     expect(Object.keys(result).sort()).toStrictEqual([
-      'refused', 'robotsDisallowed', 'snapshotIds', 'stored',
+      'extractableSnapshotIds', 'httpError', 'httpUnavailable',
+      'refused', 'robotsDisallowed', 'stored',
     ]);
   }, 60_000);
 
@@ -200,4 +210,115 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
       spy.close();
     }
   }, 60_000);
+  // ------------------------------------------------- terminal vs retryable
+  describe('a terminal HTTP error ends the job; a transient one retries (§6, §8)', () => {
+    it('counts a 4xx as http_error, not stored, and does not list it as extractable', async () => {
+      const job = await claimFetchJob([`${originUrl}/status/403`]);
+      const result = await handleWebFetch(job, deps());
+
+      expect(result.httpError).toBe(1);
+      expect(result.stored).toBe(0);
+      expect(result.refused).toBe(0);
+      expect(result.httpUnavailable).toBe(0);
+      // The id exists in web_snapshots, and deliberately not here: this list is
+      // what Day 4 iterates to enqueue web.extract.
+      expect(result.extractableSnapshotIds).toHaveLength(0);
+    }, 60_000);
+
+    it('does not throw for an all-4xx job, so the job completes instead of retrying', async () => {
+      // Throwing would be a failed attempt, and a failed attempt means two more
+      // requests at a site that has already answered 403.
+      const job = await claimFetchJob([`${originUrl}/status/404`]);
+      await expect(handleWebFetch(job, deps())).resolves.toMatchObject({ httpError: 1 });
+    }, 60_000);
+
+    it('a 429 behaves the same way and is never worked around', async () => {
+      requests = [];
+      const job = await claimFetchJob([`${originUrl}/status/429`]);
+      const result = await handleWebFetch(job, deps());
+      expect(result.httpError).toBe(1);
+      expect(result.extractableSnapshotIds).toHaveLength(0);
+      expect(requests.filter((path) => path === '/status/429')).toHaveLength(1);
+    }, 60_000);
+
+    it('throws for a 5xx, which is what drives §6 backoff', async () => {
+      const job = await claimFetchJob([`${originUrl}/status/503`]);
+      await expect(handleWebFetch(job, deps())).rejects.toThrow(/no page could be fetched/);
+    }, 60_000);
+
+    it('never lets the error page text reach the worker or the table', async () => {
+      const job = await claimFetchJob([`${originUrl}/status/403`]);
+      const result = await handleWebFetch(job, deps());
+      expect(JSON.stringify(result)).not.toContain('HANDLER_ERROR_MARKER');
+
+      const { rows } = await db.adminPool.query<{ hits: string }>(
+        `SELECT count(*) AS hits FROM web_snapshots WHERE text LIKE '%HANDLER_ERROR_MARKER%'`,
+      );
+      expect(rows[0]?.hits).toBe('0');
+    }, 60_000);
+  });
+
+  describe('through the real queue (§6)', () => {
+    it('a 403 job succeeds on its first attempt, having asked once', async () => {
+      requests = [];
+      const job = await claimFetchJob([`${originUrl}/status/403`], 3);
+      await handleWebFetch(job, deps());
+      await completeJob(app, job);
+
+      const { rows } = await app.query<{ status: string; attempts: number }>(
+        'SELECT status, attempts FROM jobs WHERE id = $1',
+        [job.id],
+      );
+      expect(rows[0]?.status).toBe('succeeded');
+      expect(rows[0]?.attempts).toBe(1);
+      expect(requests.filter((path) => path === '/status/403')).toHaveLength(1);
+    }, 60_000);
+
+    it('a 503 job exhausts its budget and goes dead, asking once per attempt', async () => {
+      requests = [];
+      let job = await claimFetchJob([`${originUrl}/status/503`], 2);
+
+      const outcomes: string[] = [];
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const failure = await handleWebFetch(job, deps()).then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        expect(failure).toBeInstanceOf(Error);
+        const result = await failJob(app, job, failure);
+        outcomes.push(result.status);
+
+        if (result.status === 'dead') {
+          break;
+        }
+        // Backoff is min(60 * 2^attempts, 3600) seconds, so the next attempt is
+        // not claimable for at least two minutes. Standing in for the passage
+        // of time is the only way to exercise the budget in a test.
+        await db.adminPool.query('UPDATE jobs SET run_after = now() WHERE id = $1', [job.id]);
+        const next = await claimJob(app, 'test-worker');
+        if (next === undefined) {
+          throw new Error('the job did not return to the queue');
+        }
+        job = next;
+      }
+
+      expect(outcomes).toStrictEqual(['queued', 'dead']);
+
+      const { rows } = await app.query<{ status: string; attempts: number }>(
+        'SELECT status, attempts FROM jobs WHERE id = $1',
+        [job.id],
+      );
+      expect(rows[0]?.status).toBe('dead');
+      expect(rows[0]?.attempts).toBe(2);
+      // Two attempts, two requests: bounded, not a loop.
+      expect(requests.filter((path) => path === '/status/503')).toHaveLength(2);
+
+      // And nothing was stored for it, at any attempt.
+      const stored = await db.adminPool.query<{ hits: string }>(
+        'SELECT count(*) AS hits FROM web_snapshots WHERE company_id = $1 AND http_status = 503',
+        [companyId],
+      );
+      expect(stored.rows[0]?.hits).toBe('0');
+    }, 120_000);
+  });
 });

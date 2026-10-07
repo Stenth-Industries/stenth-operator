@@ -66,6 +66,7 @@ export interface FetchOutcome {
   readonly finalUrl: string;
   readonly httpStatus: number;
   readonly contentType: string;
+  /** The response body, and empty for any non-2xx status — see guardedFetch. */
   readonly body: string;
   readonly bytes: number;
   /** Every URL in the chain, first requested to final. */
@@ -325,11 +326,18 @@ export async function guardedFetch(
 
       const { body, bytes } = await readCapped(response.body, policy.maxBodyBytes, current.href);
 
+      // An error page's body is dropped here, at the edge, rather than handed
+      // up and then not used. A 403 or a 404 body is not evidence and nothing
+      // downstream may parse it, so making it unavailable is stronger than
+      // asking every caller to remember that. `bytes` is still the real count,
+      // which is what a diagnostic row wants.
+      const success = response.statusCode >= 200 && response.statusCode < 300;
+
       return {
         finalUrl: current.href,
         httpStatus: response.statusCode,
         contentType: contentType === '' ? 'text/html' : contentType,
-        body,
+        body: success ? body : '',
         bytes,
         chain,
         truncated: false,

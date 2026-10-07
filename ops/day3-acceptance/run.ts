@@ -22,8 +22,11 @@
  * Modes:
  *
  *   plan      (default) prints exactly what enqueueing would do. Writes nothing.
- *   enqueue   does it. Requires --yes.
- *   report    read-only; prints the acceptance table and the 2xx count.
+ *   enqueue   does it, for the sixteen primary firms. Requires --yes.
+ *   reserve   enqueues a small batch of reserve firms, and refuses to do so at
+ *             all once the accepted count has reached 20. The reserves exist to
+ *             close a shortfall, not to be fetched as a matter of course.
+ *   report    read-only; prints the acceptance table and the accepted count.
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -50,6 +53,12 @@ const USABLE_TEXT_CHARS = 500;
 /** Lowest priority: these jobs never jump ahead of real pipeline work (§6 claim order). */
 const ACCEPTANCE_PRIORITY = -10;
 
+/** §25 Day 3: "20 real law-firm sites fetched and stored". */
+const ACCEPTANCE_TARGET = 20;
+
+/** Reserves per `reserve` run unless --batch says otherwise. */
+const DEFAULT_RESERVE_BATCH = 4;
+
 const siteSchema = z.object({
   canonical_domain: z
     .string()
@@ -72,9 +81,9 @@ const seedSchema = z.object({
 type Site = z.infer<typeof siteSchema>;
 
 interface Options {
-  readonly mode: 'plan' | 'enqueue' | 'report';
+  readonly mode: 'plan' | 'enqueue' | 'reserve' | 'report';
   readonly only: readonly string[];
-  readonly includeReserve: boolean;
+  readonly batch: number;
   readonly staggerSeconds: number;
   readonly maxAttempts: number;
   readonly occurrence: string;
@@ -89,8 +98,8 @@ function parseArgs(argv: readonly string[]): Options {
     return hit?.slice(name.length + 3);
   };
   const mode = positional[0] ?? 'plan';
-  if (mode !== 'plan' && mode !== 'enqueue' && mode !== 'report') {
-    throw new Error(`unknown mode "${mode}": expected plan, enqueue or report`);
+  if (mode !== 'plan' && mode !== 'enqueue' && mode !== 'reserve' && mode !== 'report') {
+    throw new Error(`unknown mode "${mode}": expected plan, enqueue, reserve or report`);
   }
 
   const stagger = Number(flag('stagger-seconds') ?? '30');
@@ -107,13 +116,18 @@ function parseArgs(argv: readonly string[]): Options {
     throw new Error('--occurrence must be YYYY-MM-DD');
   }
 
+  const batch = Number(flag('batch') ?? String(DEFAULT_RESERVE_BATCH));
+  if (!Number.isInteger(batch) || batch < 1 || batch > 9) {
+    throw new Error('--batch must be between 1 and 9: reserves go out in small batches');
+  }
+
   return {
     mode,
     only: (flag('only') ?? '')
       .split(',')
       .map((value) => value.trim().toLowerCase())
       .filter((value) => value !== ''),
-    includeReserve: argv.includes('--include-reserve'),
+    batch,
     staggerSeconds: stagger,
     maxAttempts: attempts,
     occurrence,
@@ -122,27 +136,33 @@ function parseArgs(argv: readonly string[]): Options {
   };
 }
 
-function loadSites(options: Options): Site[] {
+interface Seed {
+  readonly sites: Site[];
+  readonly reserve: Site[];
+}
+
+function loadSeed(): Seed {
   const raw = readFileSync(join(__dirname, 'sites.json'), 'utf8');
   const seed = seedSchema.parse(JSON.parse(raw));
-  const pool = options.includeReserve ? [...seed.sites, ...seed.reserve] : seed.sites;
 
-  const selected =
-    options.only.length === 0
-      ? pool
-      : pool.filter((site) => options.only.includes(site.canonical_domain));
-
-  if (options.only.length > 0) {
-    for (const wanted of options.only) {
-      if (!selected.some((site) => site.canonical_domain === wanted)) {
-        throw new Error(`--only names "${wanted}", which is not in sites.json`);
-      }
-    }
-  }
-
-  const domains = new Set(selected.map((site) => site.canonical_domain));
-  if (domains.size !== selected.length) {
+  const all = [...seed.sites, ...seed.reserve];
+  const domains = new Set(all.map((site) => site.canonical_domain));
+  if (domains.size !== all.length) {
     throw new Error('sites.json contains a duplicate canonical_domain');
+  }
+  return { sites: seed.sites, reserve: seed.reserve };
+}
+
+/** Applies --only to a list, and complains about a name that is not in it. */
+function select(pool: readonly Site[], only: readonly string[]): Site[] {
+  if (only.length === 0) {
+    return [...pool];
+  }
+  const selected = pool.filter((site) => only.includes(site.canonical_domain));
+  for (const wanted of only) {
+    if (!selected.some((site) => site.canonical_domain === wanted)) {
+      throw new Error(`--only names "${wanted}", which is not in this list in sites.json`);
+    }
   }
   return selected;
 }
@@ -204,6 +224,59 @@ async function registerCompany(pool: Pool, site: Site): Promise<CompanyRow> {
   return { id: row.id, legal_name: row.legal_name, created: false };
 }
 
+/**
+ * How many distinct firms currently have usable evidence, database-wide.
+ *
+ * Read from the usable_snapshots view (migration 005), not from web_snapshots
+ * with a hand-written predicate: the view is the single definition of "this is
+ * the firm's own page, fetched with permission, and it answered 2xx", and it
+ * excludes the one pre-correction 403 row that a `text IS NOT NULL` filter
+ * would still let through.
+ *
+ * Deliberately not scoped to sites.json. The four firms accepted before this
+ * harness existed count toward §25's twenty just as much as these do, and the
+ * gate on the reserves has to be the real total or it is not a gate.
+ */
+async function acceptedCount(pool: Pool): Promise<number> {
+  const { rows } = await pool.query<{ firms: string }>(
+    `SELECT count(DISTINCT company_id) AS firms
+       FROM usable_snapshots
+      WHERE length(text) >= $1`,
+    [USABLE_TEXT_CHARS],
+  );
+  return Number(rows[0]?.firms ?? 0);
+}
+
+async function acceptedDomains(pool: Pool): Promise<string[]> {
+  const { rows } = await pool.query<{ canonical_domain: string }>(
+    `SELECT DISTINCT c.canonical_domain
+       FROM usable_snapshots s
+       JOIN companies c ON c.id = s.company_id
+      WHERE length(s.text) >= $1
+      ORDER BY c.canonical_domain`,
+    [USABLE_TEXT_CHARS],
+  );
+  return rows.map((row) => row.canonical_domain);
+}
+
+/** Reserve firms that have never been enqueued by this harness. */
+async function untouchedReserves(pool: Pool, reserve: readonly Site[]): Promise<Site[]> {
+  const untouched: Site[] = [];
+  for (const site of reserve) {
+    const { rows } = await pool.query<{ hits: string }>(
+      `SELECT count(*) AS hits
+         FROM jobs j
+         JOIN companies c ON c.id = (j.payload->>'company_id')::uuid
+        WHERE j.kind = 'web.fetch' AND c.canonical_domain = $1`,
+      [site.canonical_domain],
+    );
+    if (rows[0]?.hits === '0') {
+      untouched.push(site);
+    }
+  }
+  return untouched;
+}
+
 async function runPlan(pool: Pool, sites: readonly Site[], options: Options): Promise<void> {
   console.log(`plan: ${sites.length} sites, occurrence ${options.occurrence}`);
   console.log(
@@ -254,7 +327,15 @@ async function runEnqueue(pool: Pool, sites: readonly Site[], options: Options):
   if (!options.confirmed) {
     throw new Error('enqueue writes to the database; pass --yes to confirm');
   }
+  return enqueueAll(pool, sites, options);
+}
 
+/** The write loop. Shared by `enqueue` and `reserve`, which differ only in gating. */
+async function enqueueAll(
+  pool: Pool,
+  sites: readonly Site[],
+  options: Options,
+): Promise<number> {
   const startedAt = Date.now();
   let enqueued = 0;
   let duplicate = 0;
@@ -310,6 +391,67 @@ async function runEnqueue(pool: Pool, sites: readonly Site[], options: Options):
   );
   console.log('Then: report');
   return enqueued;
+}
+
+/**
+ * Enqueues a small batch of reserves, and only while there is a shortfall.
+ *
+ * Three separate brakes, because the instruction was not "fetch more sites" but
+ * "do not hammer the reserves":
+ *
+ *   1. Nothing goes out at all once the accepted count has reached 20. The
+ *      reserves close a gap; they are not a second round.
+ *   2. The batch is capped at the size of the gap, so reaching 19 of 20 sends
+ *      one request, not nine.
+ *   3. A reserve this harness has already enqueued is never enqueued again,
+ *      whatever its outcome was. A site that answered 403 is not asked twice.
+ */
+async function runReserve(pool: Pool, reserve: readonly Site[], options: Options): Promise<void> {
+  const accepted = await acceptedCount(pool);
+  console.log(`accepted so far: ${accepted} of ${ACCEPTANCE_TARGET}`);
+
+  if (accepted >= ACCEPTANCE_TARGET) {
+    console.log(
+      'The target is met, so no reserve is enqueued. Run `report` for the table; ' +
+        'nothing further needs to be fetched.',
+    );
+    return;
+  }
+
+  const shortfall = ACCEPTANCE_TARGET - accepted;
+  const candidates = await untouchedReserves(pool, select(reserve, options.only));
+  if (candidates.length === 0) {
+    console.log(
+      `Short by ${shortfall}, but every reserve in sites.json has already been ` +
+        'enqueued. Verify a further real firm, add it with its evidence_url, and ' +
+        'run this again — do not re-ask a site that already answered.',
+    );
+    return;
+  }
+
+  const take = Math.min(options.batch, shortfall, candidates.length);
+  const batch = candidates.slice(0, take);
+
+  console.log(
+    `short by ${shortfall}; taking ${take} of ${candidates.length} untouched reserves ` +
+      `(batch cap ${options.batch})`,
+  );
+  console.log('');
+
+  if (options.mode === 'reserve' && !options.confirmed) {
+    for (const [index, site] of batch.entries()) {
+      console.log(` ${index + 1}  ${site.canonical_domain.padEnd(36)} would enqueue`);
+    }
+    console.log('');
+    console.log('Nothing was written. Re-run with: reserve --yes');
+    return;
+  }
+
+  await enqueueAll(pool, batch, options);
+  console.log(
+    `remaining untouched reserves: ${candidates.length - take}. ` +
+      'Run `report`, and only come back here if there is still a shortfall.',
+  );
 }
 
 interface ReportRow {
@@ -426,7 +568,12 @@ function countsTowardAcceptance(row: ReportRow): boolean {
   );
 }
 
-function printReport(rows: readonly ReportRow[]): void {
+interface AcceptanceTotals {
+  readonly accepted: number;
+  readonly domains: readonly string[];
+}
+
+function printReport(rows: readonly ReportRow[], totals: AcceptanceTotals): void {
   const header = [
     'company'.padEnd(42),
     'domain'.padEnd(36),
@@ -465,23 +612,69 @@ function printReport(rows: readonly ReportRow[]): void {
   console.log(`* trading name read off the domain, not stated by a source — see sites.json`);
   console.log('');
   console.log(
-    `counts toward the §25 Day 3 target: ${counted.length} of ${rows.length} ` +
-      `(2xx, robots-allowed, >=${USABLE_TEXT_CHARS} chars of extracted text)`,
+    `accepted from this harness: ${counted.length} of ${rows.length} ` +
+      `(unique, 2xx, robots-allowed, >=${USABLE_TEXT_CHARS} chars of extracted text)`,
   );
 
-  const stored403 = rows.filter(
+  // The number §25 is actually measured against, which includes the firms
+  // accepted before this harness existed. Read from usable_snapshots, so a
+  // non-2xx row cannot reach it.
+  console.log(
+    `accepted across the whole database: ${totals.accepted} of ${ACCEPTANCE_TARGET}` +
+      (totals.accepted >= ACCEPTANCE_TARGET ? ' — target met' : ''),
+  );
+  const outside = totals.domains.filter(
+    (domain) => !rows.some((row) => row.site.canonical_domain === domain),
+  );
+  if (outside.length > 0) {
+    console.log(`  of which not in sites.json: ${outside.join(', ')}`);
+  }
+  if (totals.accepted < ACCEPTANCE_TARGET) {
+    console.log(
+      `  short by ${ACCEPTANCE_TARGET - totals.accepted}. ` +
+        'To close it: `reserve --yes`, which enqueues at most the shortfall and ' +
+        'refuses to run once the target is met.',
+    );
+  }
+
+  const errored = rows.filter(
     (row) => row.snapshot_id !== null && row.http_status !== null && row.http_status >= 400,
   );
-  if (stored403.length > 0) {
+  if (errored.length > 0) {
     console.log('');
     console.log(
-      `NOTE: ${stored403.length} snapshot(s) stored with a >=400 status: ` +
-        stored403.map((row) => `${row.site.canonical_domain} (${row.http_status})`).join(', '),
+      `${errored.length} site(s) answered with an error status: ` +
+        errored.map((row) => `${row.site.canonical_domain} (${row.http_status})`).join(', '),
     );
     console.log(
-      'These are error pages, not evidence. They are excluded from the count above, ' +
-        'and ops/day3-acceptance/findings.md explains why the fetcher should not be ' +
-        'storing them as successes at all.',
+      'Each is a diagnostic row with text NULL — status, bytes and URL only. It is ' +
+        'not evidence, it is excluded from usable_snapshots by construction, and the ' +
+        'site was asked once and not retried.',
+    );
+  }
+
+  // Finding 2, still an open policy question: §8 re-validates every redirect
+  // hop for scheme, port and address but not for host, so a snapshot can end up
+  // on a domain that is not the firm's. apex -> www is normal; anything else
+  // must be looked at by a person before Day 4 treats it as company evidence.
+  const offDomain = rows.filter((row) => {
+    if (row.final_url === null) {
+      return false;
+    }
+    const host = row.final_url.replace(/^https?:\/\//, '').split('/')[0] ?? '';
+    const domain = row.site.canonical_domain;
+    return host !== domain && host !== `www.${domain}`;
+  });
+  if (offDomain.length > 0) {
+    console.log('');
+    console.log(`OFF-DOMAIN FINAL URL on ${offDomain.length} site(s):`);
+    for (const row of offDomain) {
+      console.log(`  ${row.site.canonical_domain} -> ${row.final_url}`);
+    }
+    console.log(
+      'Flagged, not filtered: the registrable-domain policy is undecided ' +
+        '(findings.md, finding 2). Day 4 must not consume these as company ' +
+        'evidence until it is resolved.',
     );
   }
 }
@@ -497,23 +690,56 @@ async function main(): Promise<void> {
     );
   }
 
-  const sites = loadSites(options);
+  const seed = loadSeed();
   const pool = createPool(databaseUrl);
   try {
     if (options.mode === 'plan') {
-      await runPlan(pool, sites, options);
+      await runPlan(pool, select(seed.sites, options.only), options);
       return;
     }
     if (options.mode === 'enqueue') {
-      await runEnqueue(pool, sites, options);
+      await runEnqueue(pool, select(seed.sites, options.only), options);
+      return;
+    }
+    if (options.mode === 'reserve') {
+      await runReserve(pool, seed.reserve, options);
       return;
     }
 
-    const rows = await collect(pool, sites);
+    // The report covers the primaries always, and a reserve once it has been
+    // registered — an untouched reserve is not part of the run.
+    const touched = new Set(
+      (
+        await pool.query<{ canonical_domain: string }>(
+          'SELECT canonical_domain FROM companies WHERE canonical_domain = ANY($1::citext[])',
+          [seed.reserve.map((site) => site.canonical_domain)],
+        )
+      ).rows.map((row) => row.canonical_domain),
+    );
+    const rows = await collect(pool, [
+      ...seed.sites,
+      ...seed.reserve.filter((site) => touched.has(site.canonical_domain)),
+    ]);
+    const totals: AcceptanceTotals = {
+      accepted: await acceptedCount(pool),
+      domains: await acceptedDomains(pool),
+    };
     if (options.json) {
-      console.log(JSON.stringify({ usable_text_chars: USABLE_TEXT_CHARS, rows }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            usable_text_chars: USABLE_TEXT_CHARS,
+            acceptance_target: ACCEPTANCE_TARGET,
+            accepted_total: totals.accepted,
+            accepted_domains: totals.domains,
+            rows,
+          },
+          null,
+          2,
+        ),
+      );
     } else {
-      printReport(rows);
+      printReport(rows, totals);
     }
   } finally {
     await pool.end();

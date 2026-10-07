@@ -63,9 +63,12 @@ describeWithDb('operator_fetch holds exactly the privileges the fetcher needs', 
 
   describe('what §8 step 4 needs in order to store a page', () => {
     it('inserts a snapshot', async () => {
+      // http_status 200 is not decoration: migration 005 permits text only
+      // behind a 2xx, so a realistic store is the only store that works.
       await attempt(
-        `INSERT INTO web_snapshots (company_id, url, content_hash, text, robots_allowed)
-         VALUES ($1, 'https://matrix-example.com.au/', 'h1', 'body text', true)`,
+        `INSERT INTO web_snapshots
+           (company_id, url, http_status, content_hash, text, robots_allowed)
+         VALUES ($1, 'https://matrix-example.com.au/', 200, 'h1', 'body text', true)`,
         [companyId],
       );
     });

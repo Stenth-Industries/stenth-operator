@@ -215,3 +215,57 @@ describe('002_roles.sql grants the five roles of §17', () => {
     expect(roleStatements).not.toMatch(/\bALTER ROLE\b/i);
   });
 });
+
+/**
+ * Migration 005: the structural half of finding 1.
+ *
+ * The fetcher no longer writes a text-bearing non-2xx row, but code is what a
+ * future change replaces. §1: "If a guarantee can be structural, it must be
+ * structural." These assertions are about the SQL as committed; the behaviour
+ * against a real PostgreSQL is in tests/reliability/http-status-outcomes.test.ts.
+ */
+describe('migration 005: page text requires a 2xx (§8, §9)', () => {
+  const sql = readFileSync(join(migrationsDir, '005_snapshot_text_requires_2xx.sql'), 'utf8');
+  const statements = statementsOnly(sql);
+
+  it('constrains text to a 2xx status', () => {
+    expect(statements).toContain('ADD CONSTRAINT web_snapshots_text_requires_2xx');
+    expect(statements).toMatch(/http_status BETWEEN 200 AND 299/);
+    // text IS NULL stays legal: the robots-disallowed row and a pruned snapshot
+    // both need it (§8, §15).
+    expect(statements).toMatch(/text IS NULL/);
+  });
+
+  it('adds it NOT VALID, so the one pre-correction row survives', () => {
+    // The user's instruction was explicit: keep the historical 403 and write no
+    // delete migration. NOT VALID enforces the rule on every new write and
+    // skips the scan of what is already there.
+    expect(statements).toMatch(/NOT VALID/);
+  });
+
+  it('deletes nothing and drops nothing', () => {
+    expect(statements).not.toMatch(/\bDELETE\b/i);
+    expect(statements).not.toMatch(/\bTRUNCATE\b/i);
+    expect(statements).not.toMatch(/\bDROP TABLE\b/i);
+    expect(statements).not.toMatch(/\bDROP COLUMN\b/i);
+    // No down migration, per §19 rule 3.
+    expect(statements).not.toMatch(/DROP CONSTRAINT(?! IF EXISTS)/i);
+  });
+
+  it('defines the one predicate later analysis reads', () => {
+    expect(statements).toContain('CREATE OR REPLACE VIEW usable_snapshots');
+    expect(statements).toMatch(/http_status BETWEEN 200 AND 299/);
+    expect(statements).toMatch(/robots_allowed/);
+    expect(statements).toMatch(/text IS NOT NULL/);
+  });
+
+  it('never grants that view to the fetcher role', () => {
+    // A view runs with its owner's privileges, so granting usable_snapshots to
+    // operator_fetch would hand back the page text migration 004 withheld
+    // column by column. Granting it to the app and the read-only role is fine.
+    expect(statements).toContain('GRANT SELECT ON usable_snapshots TO operator_app');
+    expect(statements).toContain('GRANT SELECT ON usable_snapshots TO operator_ro');
+    expect(statements).not.toMatch(/usable_snapshots TO operator_fetch/);
+    expect(statements).not.toMatch(/usable_snapshots TO PUBLIC/i);
+  });
+});

@@ -1,22 +1,29 @@
 {
   "note": [
-    "Sixteen genuine Australian criminal and traffic defence law firms for the",
-    "Day 3 fetcher acceptance run (SPEC.md §25 Day 3).",
+    "Sixteen primary firms plus nine reserves: genuine Australian criminal and",
+    "traffic defence law firms, for the Day 3 fetcher acceptance run",
+    "(SPEC.md \u00a725 Day 3).",
     "",
     "Every name and domain here came from a web search result at the URL in",
-    "`evidence_url` — none was recalled or constructed. `name_evidence` says how",
+    "`evidence_url` \u2014 none was recalled or constructed. `name_evidence` says how",
     "firmly the trading name is attached to the domain:",
     "",
-    "  stated  — a result named the firm and gave this domain as its website.",
-    "  domain  — the domain appeared in a criminal/traffic-lawyer search result,",
+    "  stated  \u2014 a result named the firm and gave this domain as its website.",
+    "  domain  \u2014 the domain appeared in a criminal/traffic-lawyer search result,",
     "            but no result spelled out the trading name. The name below is",
     "            read off the domain, so treat it as provisional: the domain is",
     "            the identity that matters (companies.canonical_domain), and the",
     "            name can be corrected later without touching the acceptance",
     "            result.",
     "",
+    "The reserves exist only to reach 20 if primaries are refused or stale. They",
+    "are never enqueued automatically: `run.ts reserve` refuses to run while the",
+    "accepted count is already 20 or more, and takes at most --batch of them at a",
+    "time. Nothing here is hammered \u2014 one homepage per firm, 30 seconds apart,",
+    "one attempt.",
+    "",
     "Checked 2026-10-07. A firm can rebrand or move hosts, so a 404 or a DNS",
-    "failure here is a stale entry, not a fetcher bug — see README.md §E."
+    "failure here is a stale entry, not a fetcher bug \u2014 see README.md \u00a7E."
   ],
   "sites": [
     {
@@ -150,13 +157,77 @@
   ],
   "reserve": [
     {
+      "canonical_domain": "ngm.com.au",
+      "legal_name": "Nyman Gibson Miralis",
+      "state": "NSW",
+      "focus": "criminal defence, including complex and international crime",
+      "name_evidence": "stated",
+      "evidence_url": "https://ngm.com.au/about-nyman-gibson-miralis/"
+    },
+    {
+      "canonical_domain": "obriensolicitors.com.au",
+      "legal_name": "O'Brien Criminal & Civil Solicitors",
+      "state": "NSW",
+      "focus": "criminal and civil litigation",
+      "name_evidence": "stated",
+      "evidence_url": "https://obriensolicitors.com.au/defence-lawyers-sydney/"
+    },
+    {
+      "canonical_domain": "sladesparsons.com.au",
+      "legal_name": "Slades & Parsons",
+      "state": "VIC",
+      "focus": "criminal defence, exclusively",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.sladesparsons.com.au"
+    },
+    {
+      "canonical_domain": "russolawyers.com.au",
+      "legal_name": "Russo Lawyers",
+      "state": "QLD",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://russolawyers.com.au/traffic-lawyers-in-brisbane"
+    },
+    {
+      "canonical_domain": "drivinglaw.com.au",
+      "legal_name": "Clarity Law",
+      "state": "QLD",
+      "focus": "traffic and drink-driving defence, exclusively",
+      "name_evidence": "stated",
+      "evidence_url": "https://drivinglaw.com.au/dui-drink-driving-lawyers-ipswich"
+    },
+    {
+      "canonical_domain": "gnl.com.au",
+      "legal_name": "Gilshenan & Luton",
+      "state": "QLD",
+      "focus": "criminal defence and employment law",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.similarweb.com/company/gnl.com.au/"
+    },
+    {
+      "canonical_domain": "lawsonlegal.com.au",
+      "legal_name": "Lawson Legal",
+      "state": "WA",
+      "focus": "criminal and serious traffic offences",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.top4.com.au/business/lawson-legal-criminal-law-117094"
+    },
+    {
+      "canonical_domain": "abetzcurtis.com.au",
+      "legal_name": "Abetz Curtis Lawyers",
+      "state": "TAS",
+      "focus": "criminal law among other practice areas",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.ampliz.com/company/abetz-curtis-lawyers/89722831"
+    },
+    {
       "canonical_domain": "tgb.com.au",
       "legal_name": "Tindall Gask Bentley",
       "state": "SA",
       "focus": "multi-practice, includes criminal defence",
       "name_evidence": "stated",
       "evidence_url": "https://tgb.com.au/areas-served/criminal-lawyer-adelaide/",
-      "why_reserve": "Larger multi-practice firm, so a §10 hard disqualifier later. Fine as a fetch target; use it only to replace a primary entry that turns out to be stale."
+      "why_reserve": "Larger multi-practice firm, so a \u00a710 hard disqualifier later. Fine as a fetch target; use it last."
     }
   ]
 }

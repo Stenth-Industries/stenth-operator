@@ -14,15 +14,20 @@
 -- connection string is pasted, and nothing from .env is read or echoed.
 
 \echo '== 1. Acceptance count: unique firms with usable 2xx evidence =='
--- The §25 criterion, as one number. 200-299, robots-allowed, and at least 500
--- characters of extracted text — the floor that separates a real homepage
--- (thousands of characters) from an error page or a JavaScript shell (dozens).
-SELECT count(DISTINCT c.id) AS firms_counted
-FROM companies c
-JOIN web_snapshots s ON s.company_id = c.id
-WHERE s.http_status BETWEEN 200 AND 299
-  AND s.robots_allowed
-  AND length(s.text) >= 500;
+-- The §25 criterion, as one number, against a target of 20.
+--
+-- Read from usable_snapshots (migration 005) rather than from web_snapshots
+-- with a hand-written predicate. The view is the single definition of "the
+-- firm's own page, fetched with permission, which answered 2xx and still has
+-- text", and it excludes the one pre-correction 403 row that a plain
+-- `text IS NOT NULL` filter would still let through. The 500-character floor is
+-- the acceptance threshold on top: it separates a real homepage (thousands of
+-- characters) from a parked domain or a JavaScript shell (dozens).
+SELECT count(DISTINCT company_id) AS firms_counted,
+       20                         AS target,
+       greatest(20 - count(DISTINCT company_id), 0) AS short_by
+FROM usable_snapshots
+WHERE length(text) >= 500;
 
 \echo ''
 \echo '== 2. Per-site acceptance table =='
@@ -37,9 +42,8 @@ SELECT c.legal_name,
        s.bytes,
        length(s.text)                                      AS text_length,
        (s.id IS NOT NULL)                                  AS snapshot_stored,
-       (s.http_status BETWEEN 200 AND 299
-         AND s.robots_allowed
-         AND length(s.text) >= 500)                        AS counts,
+       (EXISTS (SELECT 1 FROM usable_snapshots u
+                 WHERE u.id = s.id AND length(u.text) >= 500)) AS counts,
        left(coalesce(j.last_error, ''), 120)               AS error
 FROM companies c
 LEFT JOIN LATERAL (
@@ -61,15 +65,21 @@ WHERE j.status IS NOT NULL
 ORDER BY counts DESC NULLS LAST, c.canonical_domain;
 
 \echo ''
-\echo '== 3. Snapshots stored with an error status =='
--- Should be empty. Anything here is an error page sitting in the evidence table
--- with robots_allowed = true, indistinguishable from a real page to every later
--- stage. See ops/day3-acceptance/findings.md, finding 1.
-SELECT c.canonical_domain, s.http_status, length(s.text) AS text_length, s.fetched_at
+\echo '== 3. Snapshots with an error status: expect text_length NULL on every row =='
+-- These rows are expected now, and they are diagnostics: a 4xx is stored with
+-- status, bytes and URL, and `text` NULL. What must never appear is a non-NULL
+-- text_length, which is the shape of the bug fixed in migration 005 — the
+-- constraint refuses it for anything written from now on, and `is_legacy` marks
+-- the one pre-correction row that is kept as history.
+SELECT c.canonical_domain,
+       s.http_status,
+       length(s.text)         AS text_length,
+       (s.text IS NOT NULL)   AS is_legacy,
+       s.fetched_at
 FROM web_snapshots s
 JOIN companies c ON c.id = s.company_id
-WHERE s.http_status >= 400
-ORDER BY s.fetched_at DESC;
+WHERE s.http_status >= 400 OR s.http_status < 200
+ORDER BY is_legacy DESC, s.fetched_at DESC;
 
 \echo ''
 \echo '== 4. Job outcomes for the acceptance run =='
@@ -144,3 +154,18 @@ FROM web_snapshots s
 JOIN companies c ON c.id = s.company_id
 WHERE s.url IS NOT NULL
 ORDER BY off_domain DESC, c.canonical_domain;
+
+\echo ''
+\echo '== 12. The non-2xx guard is installed and still NOT VALID =='
+-- convalidated = false is correct and deliberate: the one pre-correction 403
+-- row is kept, so validating the constraint against history would fail. The
+-- check is enforced on every new write regardless.
+SELECT conname, convalidated, pg_get_constraintdef(oid) AS definition
+FROM pg_constraint
+WHERE conname = 'web_snapshots_text_requires_2xx';
+
+\echo ''
+\echo '== 13. The fetcher role cannot read the evidence view =='
+-- Expect false. A view runs with its owner's privileges, so a grant here would
+-- undo migration 004's column-level withholding of web_snapshots.text.
+SELECT has_table_privilege('operator_fetch', 'usable_snapshots', 'SELECT') AS fetcher_can_read;
