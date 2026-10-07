@@ -1,0 +1,162 @@
+{
+  "note": [
+    "Sixteen genuine Australian criminal and traffic defence law firms for the",
+    "Day 3 fetcher acceptance run (SPEC.md §25 Day 3).",
+    "",
+    "Every name and domain here came from a web search result at the URL in",
+    "`evidence_url` — none was recalled or constructed. `name_evidence` says how",
+    "firmly the trading name is attached to the domain:",
+    "",
+    "  stated  — a result named the firm and gave this domain as its website.",
+    "  domain  — the domain appeared in a criminal/traffic-lawyer search result,",
+    "            but no result spelled out the trading name. The name below is",
+    "            read off the domain, so treat it as provisional: the domain is",
+    "            the identity that matters (companies.canonical_domain), and the",
+    "            name can be corrected later without touching the acceptance",
+    "            result.",
+    "",
+    "Checked 2026-10-07. A firm can rebrand or move hosts, so a 404 or a DNS",
+    "failure here is a stale entry, not a fetcher bug — see README.md §E."
+  ],
+  "sites": [
+    {
+      "canonical_domain": "sydneycriminallawyers.com.au",
+      "legal_name": "Sydney Criminal Lawyers",
+      "state": "NSW",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.sydneycriminallawyers.com.au/find-a-lawyer-near-me/wollongong/"
+    },
+    {
+      "canonical_domain": "criminaldefencelawyers.com.au",
+      "legal_name": "Criminal Defence Lawyers",
+      "state": "NSW",
+      "focus": "criminal defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.criminaldefencelawyers.com.au"
+    },
+    {
+      "canonical_domain": "aclawgroup.com.au",
+      "legal_name": "Australian Criminal Law Group",
+      "state": "NSW",
+      "focus": "criminal defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://aclawgroup.com.au/"
+    },
+    {
+      "canonical_domain": "astorlegal.com.au",
+      "legal_name": "Astor Legal",
+      "state": "NSW",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://astorlegal.com.au/criminal-lawyers-wollongong"
+    },
+    {
+      "canonical_domain": "streetoncriminallawyers.com.au",
+      "legal_name": "Streeton Criminal Lawyers",
+      "state": "NSW",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://mobile.top4.com.au/business/streeton-criminal-lawyers-116323"
+    },
+    {
+      "canonical_domain": "jamesonlaw.com.au",
+      "legal_name": "Jameson Law",
+      "state": "NSW",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "domain",
+      "evidence_url": "https://jamesonlaw.com.au/location/sydney/"
+    },
+    {
+      "canonical_domain": "pottslawyers.com.au",
+      "legal_name": "Potts Lawyers",
+      "state": "QLD",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://pottslawyers.com.au/brisbane-criminal-lawyers/"
+    },
+    {
+      "canonical_domain": "guestlawyers.com.au",
+      "legal_name": "Guest Lawyers",
+      "state": "QLD",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://guestlawyers.com.au/about/"
+    },
+    {
+      "canonical_domain": "cridlandhua.com",
+      "legal_name": "Cridland & Hua",
+      "state": "QLD",
+      "focus": "criminal and quasi-criminal defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.cridlandhua.com/"
+    },
+    {
+      "canonical_domain": "papahughes.com.au",
+      "legal_name": "Papa Hughes",
+      "state": "VIC",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://papahughes.com.au/"
+    },
+    {
+      "canonical_domain": "criminalsolicitorsmelbourne.com.au",
+      "legal_name": "Dribbin & Brown Criminal Lawyers",
+      "state": "VIC",
+      "focus": "criminal, traffic and intervention orders",
+      "name_evidence": "stated",
+      "evidence_url": "https://es.trustpilot.com/review/www.criminalsolicitorsmelbourne.com.au"
+    },
+    {
+      "canonical_domain": "gardewilson.com.au",
+      "legal_name": "Garde Wilson Lawyers",
+      "state": "VIC",
+      "focus": "criminal defence",
+      "name_evidence": "domain",
+      "evidence_url": "https://www.gardewilson.com.au/"
+    },
+    {
+      "canonical_domain": "mklawfirm.com.au",
+      "legal_name": "MK Law",
+      "state": "VIC",
+      "focus": "criminal defence",
+      "name_evidence": "domain",
+      "evidence_url": "https://www.mklawfirm.com.au/"
+    },
+    {
+      "canonical_domain": "paxmanandpaxman.com.au",
+      "legal_name": "Paxman & Paxman Criminal Lawyers",
+      "state": "WA",
+      "focus": "criminal, traffic and restraining orders",
+      "name_evidence": "stated",
+      "evidence_url": "https://paxmanandpaxman.com.au/"
+    },
+    {
+      "canonical_domain": "perthcriminallawyer.com.au",
+      "legal_name": "Perth Criminal Lawyers Curt Hofmann and Co",
+      "state": "WA",
+      "focus": "criminal and traffic defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.oneflare.com.au/b/joondalup-criminal-lawyers-curt-hofmann-and-co"
+    },
+    {
+      "canonical_domain": "caldicottlawyers.com.au",
+      "legal_name": "Caldicott Isaacs Lawyers",
+      "state": "SA",
+      "focus": "criminal defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://www.caldicottlawyers.com.au"
+    }
+  ],
+  "reserve": [
+    {
+      "canonical_domain": "tgb.com.au",
+      "legal_name": "Tindall Gask Bentley",
+      "state": "SA",
+      "focus": "multi-practice, includes criminal defence",
+      "name_evidence": "stated",
+      "evidence_url": "https://tgb.com.au/areas-served/criminal-lawyer-adelaide/",
+      "why_reserve": "Larger multi-practice firm, so a §10 hard disqualifier later. Fine as a fetch target; use it only to replace a primary entry that turns out to be stale."
+    }
+  ]
+}
