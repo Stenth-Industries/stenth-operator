@@ -11,7 +11,9 @@
  *   list                        read-only; every open reservation
  *   resolve --id=<uuid> --as=abandoned --yes
  *                               you checked the billing: no charge. The budget
- *                               is given back and the work can be re-enqueued.
+ *                               is given back, the work identity is freed, and
+ *                               the blocked job that held it is returned to the
+ *                               queue (--no-requeue to leave it blocked).
  *   resolve --id=<uuid> --as=charged --cost-usd=<n> --yes
  *                               you checked the billing: it was charged. The
  *                               month keeps the cost and the work is not
@@ -30,6 +32,7 @@ import {
   openReservations,
 } from '../../src/ai/budget';
 import { createPool } from '../../src/db/client';
+import { requeueBlockedJob } from '../../src/jobs/queue';
 
 interface Options {
   readonly mode: 'list' | 'resolve';
@@ -40,6 +43,7 @@ interface Options {
   readonly note: string;
   readonly olderThanMinutes: number;
   readonly confirmed: boolean;
+  readonly requeue: boolean;
 }
 
 function parseArgs(argv: readonly string[]): Options {
@@ -72,6 +76,7 @@ function parseArgs(argv: readonly string[]): Options {
     note: flag('note') ?? '',
     olderThanMinutes: olderThan,
     confirmed: argv.includes('--yes'),
+    requeue: !argv.includes('--no-requeue'),
   };
 }
 
@@ -133,12 +138,54 @@ async function resolve(pool: Pool, options: Options): Promise<void> {
   }
 
   if (options.as === 'abandoned') {
-    const done = await abandonReservation(pool, options.id, options.by, options.note);
+    const released = await abandonReservation(pool, options.id, options.by, options.note);
+    if (released === undefined) {
+      console.log(`Nothing to do: ${options.id} is not an open reservation.`);
+      return;
+    }
+
     console.log(
-      done
-        ? `Released. The budget is given back and this work can be enqueued again.`
-        : `Nothing to do: ${options.id} is not an open reservation.`,
+      `Released $${released.releasedUsd.toFixed(6)} back to the month. The work ` +
+        `identity is free, and the row still records it as ` +
+        `"${released.releasedKey ?? '(none)'}".`,
     );
+
+    // Freeing the identity is only half of it. §7 makes web.extract's dedupe
+    // key permanent, so the blocked job is the only row that will ever exist
+    // for this work: leave it blocked and the reservation is released into a
+    // pipeline that will never ask for it again.
+    if (released.jobId === null) {
+      console.log('No job was recorded against this reservation; nothing to requeue.');
+      return;
+    }
+    if (!options.requeue) {
+      console.log(
+        `Left job ${released.jobId} blocked (--no-requeue). Nothing will attempt ` +
+          'this work until it is requeued.',
+      );
+      return;
+    }
+
+    const requeued = await requeueBlockedJob(pool, released.jobId, 'reservation_abandoned', {
+      llm_call_id: released.callId,
+    });
+    if (requeued === undefined) {
+      console.log(
+        `Job ${released.jobId} is not blocked, so it was left alone. Check its ` +
+          'status before assuming this work is queued.',
+      );
+      return;
+    }
+    console.log(
+      `Requeued job ${requeued.jobId} (${requeued.kind}), attempt ` +
+        `${requeued.attempts + 1} of ${requeued.maxAttempts}.`,
+    );
+    if (requeued.attempts >= requeued.maxAttempts) {
+      console.log(
+        'WARNING: its attempt budget is already spent, so one more failure makes ' +
+          'it dead. Fix the cause before the worker claims it.',
+      );
+    }
     return;
   }
 

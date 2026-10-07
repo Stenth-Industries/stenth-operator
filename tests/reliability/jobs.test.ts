@@ -3,7 +3,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { baseBackoffSeconds } from '../../src/jobs/backoff';
 import { enqueue } from '../../src/jobs/enqueue';
-import { claimJob, completeJob, failJob, describeError } from '../../src/jobs/queue';
+import {
+  blockJob,
+  claimJob,
+  completeJob,
+  failJob,
+  describeError,
+  requeueBlockedJob,
+} from '../../src/jobs/queue';
 import { reap } from '../../src/worker/reaper';
 import { createTestDatabase, hasDatabase, type TestDatabase } from '../helpers/testDb';
 
@@ -315,6 +322,153 @@ describeWithDb('the job engine against real PostgreSQL (SPEC.md §6, §7)', () =
   });
 
   // ---------------------------------------------------------------- GATE 3
+  // ----------------------------------------------- undoing a terminal state
+  //
+  // blocked is terminal (§6) and web.extract's dedupe key is permanent (§7),
+  // so without a way back a job blocked by a control is a permanent hole: the
+  // enqueue that would re-create it hits ON CONFLICT and reports success. This
+  // is the only path back, and it is human-driven and attributable.
+  describe('requeueing a blocked job', () => {
+    async function blocked(dedupeKey: string, maxAttempts = 2) {
+      await seed({ dedupeKey, maxAttempts });
+      const job = await claimJob(app, 'w1');
+      if (job === undefined) {
+        throw new Error('expected to claim the seeded job');
+      }
+      await blockJob(app, job, 'reservation_in_flight', 'a provider call of unknown outcome');
+      return job;
+    }
+
+    it('moves it back to queued, claimable, with its history intact', async () => {
+      const job = await blocked('prune:requeue-me');
+
+      const requeued = await requeueBlockedJob(app, job.id, 'reservation_abandoned', {
+        llm_call_id: '00000000-0000-4000-8000-000000000001',
+      });
+      expect(requeued).toMatchObject({
+        jobId: job.id,
+        kind: 'maintenance.prune',
+        attempts: 1,
+        maxAttempts: 2,
+      });
+
+      const { rows } = await app.query<{
+        status: string;
+        attempts: number;
+        last_error: string | null;
+        locked_by: string | null;
+        dedupe_key: string;
+      }>(
+        'SELECT status, attempts, last_error, locked_by, dedupe_key FROM jobs WHERE id = $1',
+        [job.id],
+      );
+      // Same row, same dedupe key: the §7 identity of the work is unchanged.
+      expect(rows[0]).toMatchObject({
+        status: 'queued',
+        dedupe_key: 'prune:requeue-me',
+        last_error: null,
+        locked_by: null,
+      });
+      // The claim that ended in blocked really happened; it is not erased.
+      expect(rows[0]?.attempts).toBe(1);
+
+      // And a worker can now pick it up again.
+      const again = await claimJob(app, 'w2');
+      expect(again?.id).toBe(job.id);
+      expect(again?.attempts).toBe(2);
+
+      // The attempt history shows both the blocked attempt and the new one.
+      const runs = await app.query<{ attempt: number; status: string }>(
+        'SELECT attempt, status FROM job_runs WHERE job_id = $1 ORDER BY attempt',
+        [job.id],
+      );
+      expect(runs.rows.map((row) => row.attempt)).toStrictEqual([1, 2]);
+      expect(runs.rows[0]?.status).toBe('failed');
+    });
+
+    it('writes a job.requeued event naming the reason and the decision behind it', async () => {
+      const job = await blocked('prune:requeue-event');
+      await requeueBlockedJob(app, job.id, 'reservation_abandoned', {
+        llm_call_id: '00000000-0000-4000-8000-000000000002',
+      });
+
+      const { rows } = await app.query<{
+        kind: string;
+        actor_type: string;
+        payload: Record<string, unknown>;
+        trace_id: string;
+      }>(
+        `SELECT kind, actor_type::text AS actor_type, payload, trace_id
+           FROM events WHERE entity_id = $1 ORDER BY created_at`,
+        [job.id],
+      );
+      const requeued = rows.find((row) => row.kind === 'job.requeued');
+      expect(requeued).toBeDefined();
+      // A human undid a terminal state; the spine says so, and says why.
+      expect(requeued?.actor_type).toBe('human');
+      expect(requeued?.trace_id).toBe(TRACE);
+      expect(requeued?.payload).toMatchObject({
+        job_kind: 'maintenance.prune',
+        reason: 'reservation_abandoned',
+        attempts: 1,
+        max_attempts: 2,
+        llm_call_id: '00000000-0000-4000-8000-000000000002',
+      });
+      // The job.blocked event it undoes is still there. Both are facts.
+      expect(rows.some((row) => row.kind === 'job.blocked')).toBe(true);
+    });
+
+    it('refuses anything that is not blocked, and says so rather than guessing', async () => {
+      await seed({ dedupeKey: 'prune:still-queued' });
+      const { rows } = await app.query<{ id: string }>(
+        'SELECT id FROM jobs WHERE dedupe_key = $1',
+        ['prune:still-queued'],
+      );
+      const queuedId = rows[0]?.id as string;
+      expect(await requeueBlockedJob(app, queuedId, 'reservation_abandoned')).toBeUndefined();
+
+      const running = await claimJob(app, 'w1');
+      expect(await requeueBlockedJob(app, running!.id, 'reservation_abandoned')).toBeUndefined();
+      await completeJob(app, running!);
+      expect(await requeueBlockedJob(app, running!.id, 'reservation_abandoned')).toBeUndefined();
+
+      // A row that does not exist at all is the same answer, not a throw.
+      expect(
+        await requeueBlockedJob(app, '00000000-0000-4000-8000-00000000dead', 'x'),
+      ).toBeUndefined();
+
+      // Nothing moved, and no requeue event was written for any of them.
+      const events = await app.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM events WHERE kind = 'job.requeued'`,
+      );
+      expect(events.rows[0]?.count).toBe('0');
+    });
+
+    it('lets exactly one of many concurrent requeues move the job', async () => {
+      const job = await blocked('prune:requeue-race');
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          requeueBlockedJob(app, job.id, 'reservation_abandoned'),
+        ),
+      );
+      expect(results.filter((result) => result !== undefined)).toHaveLength(1);
+
+      // One move, one event: the terminal state was undone once.
+      const events = await app.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM events WHERE kind = 'job.requeued'`,
+      );
+      expect(events.rows[0]?.count).toBe('1');
+    });
+
+    it('still reports a job whose attempt budget is spent, rather than hiding it', async () => {
+      const job = await blocked('prune:last-attempt', 1);
+      const requeued = await requeueBlockedJob(app, job.id, 'budget_hard_stop');
+      // Requeued, but with nothing left: the caller has to decide, and the
+      // numbers are in front of it rather than inferred.
+      expect(requeued).toMatchObject({ attempts: 1, maxAttempts: 1 });
+    });
+  });
+
   describe('GATE: backoff', () => {
     it('schedules the retry on the §6 formula and not before', async () => {
       await seed({ dedupeKey: 'prune:backoff', maxAttempts: 5 });

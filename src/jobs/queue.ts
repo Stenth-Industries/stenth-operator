@@ -300,6 +300,106 @@ export async function blockJob(
   }
 }
 
+/** What a requeue moved, so the caller can say whether it is worth anything. */
+export interface Requeued {
+  readonly jobId: string;
+  readonly kind: JobKind;
+  readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly traceId: string;
+}
+
+/**
+ * Returns a blocked job to the queue. Human-driven, never automatic.
+ *
+ * Why this has to exist. §7 makes `web.extract`'s dedupe key permanent —
+ * `extract:<snapshot>:<schema version>` — so the row that was blocked is the
+ * only row that will ever exist for that work: a second `enqueue` hits ON
+ * CONFLICT and reports `inserted: false`, correctly and uselessly. §6 makes
+ * blocked terminal. Put together, a job blocked by a control could never run
+ * again once the control was satisfied, which turns every one-off refusal into
+ * a permanent hole in the pipeline:
+ *
+ *   * a reservation abandoned after a human checked the billing — the work was
+ *     never done and the budget has been given back, so it must be runnable;
+ *   * a `budget_hard_stop` once the ceiling is raised or the month rolls over;
+ *   * a `provider_unconfigured` once a provider is chosen and configured.
+ *
+ * So the job moves back to `queued` in place, keeping its id, its dedupe key
+ * and its attempt history. `attempts` is deliberately not reset: the claim that
+ * ended in blocked really happened, and erasing it would let a job be revived
+ * without limit. The caller gets the counters back and can see whether any
+ * attempt budget is left.
+ *
+ * Guarded on `status = 'blocked'`, so this cannot disturb a running, dead or
+ * already-queued job, and it writes a `job.requeued` event with a machine
+ * reason — the audit spine has to show that the terminal state was undone by
+ * someone, not that the job mysteriously ran twice.
+ */
+export async function requeueBlockedJob(
+  pool: Pool,
+  jobId: string,
+  reason: string,
+  context: Readonly<Record<string, string>> = {},
+): Promise<Requeued | undefined> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const moved = await client.query<{
+      kind: JobKind;
+      attempts: number;
+      max_attempts: number;
+      trace_id: string;
+    }>(
+      `UPDATE jobs SET status = 'queued', run_after = now(), last_error = NULL,
+                       locked_at = NULL, locked_by = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'blocked'
+       RETURNING kind, attempts, max_attempts, trace_id`,
+      [jobId],
+    );
+
+    const job = moved.rows[0];
+    if (job === undefined) {
+      await client.query('COMMIT');
+      return undefined;
+    }
+
+    // Machine tokens only. `context` carries ids — the llm_calls row that was
+    // reconciled, say — so the decision behind this is reachable from the
+    // event, without copying anyone's prose or name into the spine (§16).
+    await client.query(
+      `INSERT INTO events (entity_type, entity_id, kind, actor_type, payload, trace_id)
+       VALUES ('job', $1, 'job.requeued', 'human', $2::jsonb, $3)`,
+      [
+        jobId,
+        JSON.stringify({
+          job_kind: job.kind,
+          reason,
+          attempts: job.attempts,
+          max_attempts: job.max_attempts,
+          ...context,
+        }),
+        job.trace_id,
+      ],
+    );
+
+    await client.query('COMMIT');
+    return {
+      jobId,
+      kind: job.kind,
+      attempts: job.attempts,
+      maxAttempts: job.max_attempts,
+      traceId: job.trace_id,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /** Thrown when a claimed job has no registered handler. */
 export class UnregisteredKindError extends Error {
   override readonly name = 'UnregisteredKindError';

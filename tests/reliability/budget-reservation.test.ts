@@ -417,17 +417,25 @@ describeWithDb('reserve before you call (§16)', () => {
         'kushagra',
         'checked the provider dashboard: no request recorded',
       );
-      expect(released).toBe(true);
+      expect(released).toMatchObject({ callId: reserved.callId, releasedKey: key });
+      expect(released?.releasedUsd).toBeCloseTo(0.09, 6);
       expect(await monthToDate()).toBe(0);
 
       const { rows } = await app.query<{
         status: string;
         reservation_key: string | null;
+        released_reservation_key: string | null;
         reconciled_by: string;
         estimated_cost_usd: string;
-      }>('SELECT status, reservation_key, reconciled_by, estimated_cost_usd FROM llm_calls');
+      }>(
+        `SELECT status, reservation_key, released_reservation_key, reconciled_by,
+                estimated_cost_usd
+           FROM llm_calls`,
+      );
       expect(rows[0]?.status).toBe('abandoned');
       expect(rows[0]?.reservation_key).toBeNull();
+      // The key moved rather than vanished: the row still says what it claimed.
+      expect(rows[0]?.released_reservation_key).toBe(key);
       expect(rows[0]?.reconciled_by).toBe('kushagra');
       // The reservation still happened, and the row still says how much it held.
       expect(Number(rows[0]?.estimated_cost_usd)).toBeCloseTo(0.09, 6);
@@ -464,10 +472,307 @@ describeWithDb('reserve before you call (§16)', () => {
       if (reserved.kind !== 'reserved') {
         throw new Error('expected a reservation');
       }
-      expect(await abandonReservation(app, reserved.callId, 'a', 'b')).toBe(true);
+      expect(await abandonReservation(app, reserved.callId, 'a', 'b')).toBeDefined();
       // Second time: nothing to do, and it must not resurrect the row.
-      expect(await abandonReservation(app, reserved.callId, 'a', 'b')).toBe(false);
+      expect(await abandonReservation(app, reserved.callId, 'a', 'b')).toBeUndefined();
       expect(await confirmReservation(app, reserved.callId, 1, 'a', 'b')).toBe(false);
+    });
+  });
+
+  // ------------------------------------------------- the retry after a release
+  //
+  // The claim being tested is the one the reservation design rests on: an
+  // abandonment has to stop claiming the work identity, or "the budget is given
+  // back and the work can be retried" is only half true and the pipeline has a
+  // permanent hole where that extraction used to be. Every case here runs
+  // against the real unique index, because that index is the control.
+  describe('an abandoned reservation stops claiming the work', () => {
+    it('lets the same work be reserved again, exactly once, with a fresh key row', async () => {
+      const key = 'web.extract:snap-1:v1:testmodel-1:hash';
+      const first = await reserveCall(app, request({ reservationKey: key }));
+      if (first.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+
+      const released = await abandonReservation(
+        app,
+        first.callId,
+        'kushagra',
+        'provider dashboard shows no request in that minute',
+      );
+      expect(released?.releasedKey).toBe(key);
+
+      const second = await reserveCall(app, request({ reservationKey: key }));
+      expect(second.kind).toBe('reserved');
+      if (second.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+      // A new row, not the old one resurrected.
+      expect(second.callId).not.toBe(first.callId);
+
+      const { rows } = await app.query<{
+        id: string;
+        status: string;
+        reservation_key: string | null;
+        released_reservation_key: string | null;
+      }>(
+        `SELECT id, status::text AS status, reservation_key, released_reservation_key
+           FROM llm_calls ORDER BY created_at`,
+      );
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({
+        id: first.callId,
+        status: 'abandoned',
+        reservation_key: null,
+        released_reservation_key: key,
+      });
+      expect(rows[1]).toMatchObject({
+        id: second.callId,
+        status: 'reserved',
+        reservation_key: key,
+        released_reservation_key: null,
+      });
+
+      // And the identity is taken again, so the retry is itself protected.
+      const third = await reserveCall(app, request({ reservationKey: key }));
+      expect(third.kind === 'refused' && third.reason).toBe('reservation_in_flight');
+    });
+
+    it('gives the budget back, and the retry holds it again', async () => {
+      const key = 'web.extract:budget-returned';
+      const first = await reserveCall(app, request({ reservationKey: key }));
+      if (first.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+      expect(await monthToDate()).toBeCloseTo(0.09, 6);
+
+      await abandonReservation(app, first.callId, 'kushagra', 'no charge');
+      expect(await monthToDate()).toBe(0);
+
+      const second = await reserveCall(app, request({ reservationKey: key }));
+      expect(second.kind).toBe('reserved');
+      // Back to one pessimistic estimate in flight — not zero, and not two.
+      expect(await monthToDate()).toBeCloseTo(0.09, 6);
+    });
+
+    it('keeps the abandoned row permanently auditable, through the retry', async () => {
+      const key = 'web.extract:auditable';
+      const first = await reserveCall(app, request({ reservationKey: key }));
+      if (first.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+      await abandonReservation(
+        app,
+        first.callId,
+        'kushagra',
+        'OpenAI usage export for 2026-10-07 has no request at 04:12Z',
+      );
+
+      // The retry runs, is finalised, and must not disturb the audit row.
+      const second = await reserveCall(app, request({ reservationKey: key }));
+      if (second.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+      const client = await app.connect();
+      try {
+        await client.query('BEGIN');
+        await finalizeCall(client, {
+          callId: second.callId,
+          usage: { inputTokens: 9_000, outputTokens: 1_200, cachedTokens: 0 },
+          latencyMs: 2_100,
+          status: 'succeeded',
+        });
+        await client.query('COMMIT');
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await app.query<{
+        status: string;
+        cost: string;
+        estimated: string;
+        released: string | null;
+        by: string;
+        note: string;
+        reserved_at: Date;
+        finalized_at: Date;
+        provider: string;
+        model: string;
+        trace_id: string;
+        request_hash: string;
+      }>(
+        `SELECT status::text AS status, cost_usd AS cost, estimated_cost_usd AS estimated,
+                released_reservation_key AS released, reconciled_by AS by,
+                reconciliation_note AS note, reserved_at, finalized_at,
+                provider, model, trace_id, request_hash
+           FROM llm_calls WHERE id = $1`,
+        [first.callId],
+      );
+
+      // Every field a human needs to re-derive the decision, still there.
+      expect(rows[0]).toMatchObject({
+        status: 'abandoned',
+        released: key,
+        by: 'kushagra',
+        note: 'OpenAI usage export for 2026-10-07 has no request at 04:12Z',
+        provider: PROVIDER,
+        model: MODEL,
+        trace_id: TRACE,
+      });
+      expect(Number(rows[0]?.cost)).toBe(0);
+      expect(Number(rows[0]?.estimated)).toBeCloseTo(0.09, 6);
+      expect(rows[0]?.reserved_at).toBeInstanceOf(Date);
+      expect(rows[0]?.finalized_at).toBeInstanceOf(Date);
+      expect(rows[0]?.request_hash).toBe('a'.repeat(64));
+    });
+
+    it('lets exactly one of many racing retries reserve the freed work', async () => {
+      const key = 'web.extract:racing-retry';
+      const first = await reserveCall(app, request({ reservationKey: key }));
+      if (first.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+      await abandonReservation(app, first.callId, 'kushagra', 'no charge');
+
+      // Eight workers notice the work is runnable again at the same moment.
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () => reserveCall(app, request({ reservationKey: key }))),
+      );
+      const reserved = results.filter((result) => result.kind === 'reserved');
+      const refused = results.filter((result) => result.kind === 'refused');
+      expect(reserved).toHaveLength(1);
+      expect(refused).toHaveLength(7);
+      for (const result of refused) {
+        expect(result.kind === 'refused' && result.reason).toBe('reservation_in_flight');
+      }
+
+      // One provider invocation would follow, and the month holds one estimate.
+      const { rows } = await app.query<{ status: string; count: string }>(
+        `SELECT status::text AS status, count(*)::text AS count
+           FROM llm_calls GROUP BY status ORDER BY status`,
+      );
+      expect(rows).toStrictEqual([
+        { status: 'abandoned', count: '1' },
+        { status: 'reserved', count: '1' },
+      ]);
+      expect(await monthToDate()).toBeCloseTo(0.09, 6);
+    });
+
+    it('records each release separately when the same work is abandoned twice', async () => {
+      const key = 'web.extract:abandoned-twice';
+      const releases: string[] = [];
+      for (let round = 0; round < 2; round += 1) {
+        const reserved = await reserveCall(app, request({ reservationKey: key }));
+        if (reserved.kind !== 'reserved') {
+          throw new Error(`round ${round}: expected a reservation`);
+        }
+        const released = await abandonReservation(
+          app,
+          reserved.callId,
+          'kushagra',
+          `round ${round}: billing shows nothing`,
+        );
+        releases.push(released?.releasedKey ?? '(none)');
+      }
+
+      // Two honest releases of the same identity. Uniqueness here would have
+      // made the second abandonment fail and left the budget held.
+      expect(releases).toStrictEqual([key, key]);
+      const { rows } = await app.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM llm_calls
+          WHERE released_reservation_key = $1 AND status = 'abandoned'`,
+        [key],
+      );
+      expect(rows[0]?.count).toBe('2');
+      expect(await monthToDate()).toBe(0);
+      // And the work is still runnable after both.
+      expect((await reserveCall(app, request({ reservationKey: key }))).kind).toBe('reserved');
+    });
+
+    it('will not let a release record be rewritten, or faked while the key is held', async () => {
+      const key = 'web.extract:write-once';
+      const reserved = await reserveCall(app, request({ reservationKey: key }));
+      if (reserved.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+
+      // While the reservation is live, the row may not claim to have released
+      // anything: that would be a row holding and having freed the same key.
+      await expect(
+        app.query('UPDATE llm_calls SET released_reservation_key = $2 WHERE id = $1', [
+          reserved.callId,
+          key,
+        ]),
+      ).rejects.toThrow(/cannot record a released reservation key/i);
+
+      await abandonReservation(app, reserved.callId, 'kushagra', 'no charge');
+
+      // And once recorded, it is evidence: neither rewritten nor cleared.
+      await expect(
+        app.query('UPDATE llm_calls SET released_reservation_key = $2 WHERE id = $1', [
+          reserved.callId,
+          'web.extract:something-else',
+        ]),
+      ).rejects.toThrow(/write-once/i);
+      await expect(
+        app.query('UPDATE llm_calls SET released_reservation_key = NULL WHERE id = $1', [
+          reserved.callId,
+        ]),
+      ).rejects.toThrow(/write-once/i);
+
+      const { rows } = await app.query<{ released: string | null }>(
+        'SELECT released_reservation_key AS released FROM llm_calls WHERE id = $1',
+        [reserved.callId],
+      );
+      expect(rows[0]?.released).toBe(key);
+    });
+
+    it('keeps a charged reconciliation fail-closed: the identity is never freed', async () => {
+      const key = 'web.extract:charged-stays-claimed';
+      const reserved = await reserveCall(app, request({ reservationKey: key }));
+      if (reserved.kind !== 'reserved') {
+        throw new Error('expected a reservation');
+      }
+
+      expect(
+        await confirmReservation(
+          app,
+          reserved.callId,
+          0.0412,
+          'kushagra',
+          'billed: one request at 04:12Z, 9.1k in / 1.2k out',
+        ),
+      ).toBe(true);
+
+      // The money stays, the key stays, and no retry can reach the provider.
+      expect(await monthToDate()).toBeCloseTo(0.0412, 6);
+      const retry = await reserveCall(app, request({ reservationKey: key }));
+      expect(retry.kind === 'refused' && retry.reason).toBe('reservation_in_flight');
+      expect(retry.kind === 'refused' && retry.existingStatus).toBe('failed');
+
+      // Racing retries do not find a gap either.
+      const racing = await Promise.all(
+        Array.from({ length: 6 }, () => reserveCall(app, request({ reservationKey: key }))),
+      );
+      expect(racing.every((result) => result.kind === 'refused')).toBe(true);
+
+      // Nothing in the charged path touches the release column, so a charged
+      // row can never be mistaken for one whose work was handed back.
+      const { rows } = await app.query<{
+        reservation_key: string | null;
+        released: string | null;
+      }>(
+        'SELECT reservation_key, released_reservation_key AS released FROM llm_calls WHERE id = $1',
+        [reserved.callId],
+      );
+      expect(rows[0]?.reservation_key).toBe(key);
+      expect(rows[0]?.released).toBeNull();
+
+      // Freeing it is a separate, named, attributable act — and it refuses,
+      // because the row is no longer a reservation.
+      expect(await abandonReservation(app, reserved.callId, 'kushagra', 'changed my mind')).toBe(
+        undefined,
+      );
     });
   });
 

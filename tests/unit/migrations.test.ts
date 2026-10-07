@@ -376,3 +376,72 @@ describe('migration 008: the signals backfill grant (§9, §17)', () => {
     expect(statements).not.toMatch(/TO PUBLIC/i);
   });
 });
+
+/**
+ * Migration 009: an abandoned reservation keeps saying what it claimed.
+ *
+ * The release is the hinge of the retry path — it is what stops an abandoned
+ * row from claiming the work for ever — so the column that records it has to be
+ * additive, non-unique and unrewritable. Each of those is a property of the
+ * SQL, which is why they are asserted here rather than left to the comment that
+ * explains them.
+ */
+describe('migration 009: the release audit column (§16, §4)', () => {
+  const sql = readFileSync(join(migrationsDir, '009_reservation_release_audit.sql'), 'utf8');
+  const statements = statementsOnly(sql);
+
+  it('adds one nullable column, idempotently', () => {
+    const alter = /ALTER TABLE llm_calls[\s\S]*?;/.exec(statements)?.[0] ?? '';
+    expect(alter).toMatch(/ADD COLUMN IF NOT EXISTS released_reservation_key text;/);
+    // One column, nullable, no default: nothing a running system can trip over
+    // and no rewrite of the existing rows.
+    expect(alter.match(/ADD COLUMN/g)).toHaveLength(1);
+    expect(alter).not.toMatch(/\bNOT NULL\b/);
+    expect(alter).not.toMatch(/\bDEFAULT\b/i);
+    expect(statements.match(/ALTER TABLE/g)).toHaveLength(1);
+  });
+
+  it('does not make the release unique, so a second honest abandonment can happen', () => {
+    // The same work can be reserved and released more than once: a crash, a
+    // human verifying no charge, another crash. Uniqueness here would make the
+    // second release fail and leave the budget held.
+    const indexes = statements.match(/CREATE (UNIQUE )?INDEX[\s\S]*?;/g) ?? [];
+    expect(indexes).toHaveLength(1);
+    expect(indexes[0]).not.toContain('UNIQUE');
+    expect(indexes[0]).toContain('released_reservation_key');
+  });
+
+  it('makes the release write-once in the database, not by convention', () => {
+    expect(statements).toMatch(/CREATE TRIGGER llm_calls_released_key_write_once BEFORE UPDATE/);
+    expect(statements).toMatch(/restrict_violation/);
+    // Rewriting or clearing a recorded release is refused.
+    expect(statements).toMatch(
+      /OLD\.released_reservation_key IS NOT NULL\s+AND NEW\.released_reservation_key IS DISTINCT FROM OLD\.released_reservation_key/,
+    );
+    // And a row cannot claim to have released a key it is still holding.
+    expect(statements).toMatch(
+      /NEW\.released_reservation_key IS NOT NULL\s+AND NEW\.reservation_key IS NOT NULL/,
+    );
+  });
+
+  it('leaves the control itself alone: the unique index on reservation_key is untouched', () => {
+    expect(statements).not.toContain('llm_calls_reservation_key_idx');
+    expect(statements).not.toMatch(/ALTER TYPE/);
+  });
+
+  it('deletes nothing, drops nothing but its own trigger, and alters no column', () => {
+    expect(statements).not.toMatch(/\bDELETE\b/i);
+    expect(statements).not.toMatch(/\bTRUNCATE\b/i);
+    expect(statements).not.toMatch(/\bALTER COLUMN\b/i);
+    expect(statements).not.toMatch(/DROP (TABLE|COLUMN|CONSTRAINT|INDEX|VIEW|TYPE)/i);
+    // The one DROP is the standard idempotency guard in front of its own
+    // trigger, exactly as 001 writes every trigger.
+    const drops = statements.match(/DROP [A-Z ]+IF EXISTS [a-z_]+/g) ?? [];
+    expect(drops).toStrictEqual(['DROP TRIGGER IF EXISTS llm_calls_released_key_write_once']);
+  });
+
+  it('writes no down-migration (§19 rule 3)', () => {
+    expect(statements).not.toMatch(/^\s*--\s*down/im);
+    expect(statements).not.toMatch(/\bREVOKE\b/i);
+  });
+});

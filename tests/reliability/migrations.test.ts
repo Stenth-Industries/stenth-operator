@@ -112,6 +112,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '006_snapshot_signals.sql',
       '007_llm_call_reservations.sql',
       '008_fetcher_signal_backfill.sql',
+      '009_reservation_release_audit.sql',
     ]);
     expect(result.skipped).toStrictEqual([]);
   });
@@ -128,6 +129,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '006_snapshot_signals.sql',
       '007_llm_call_reservations.sql',
       '008_fetcher_signal_backfill.sql',
+      '009_reservation_release_audit.sql',
     ]);
   });
 
@@ -146,6 +148,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '006_snapshot_signals.sql',
       '007_llm_call_reservations.sql',
       '008_fetcher_signal_backfill.sql',
+      '009_reservation_release_audit.sql',
       ]) {
         await client.query(readFileSync(join(migrationsDir, file), 'utf8'));
       }

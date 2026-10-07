@@ -537,13 +537,33 @@ export async function openReservations(
   }));
 }
 
+/** What an abandonment released, for the caller that has to clean up after it. */
+export interface ReservationRelease {
+  readonly callId: string;
+  /** The work identity the row was holding, now free to be reserved again. */
+  readonly releasedKey: string | null;
+  /** The job that was running when the reservation was taken, if any. */
+  readonly jobId: string | null;
+  /** The pessimistic cost the reservation was holding, now given back. */
+  readonly releasedUsd: number;
+}
+
 /**
  * Releases a reservation that a human has verified was never charged.
  *
- * Sets the cost to zero so the budget is given back, and clears the
- * reservation key so the work can be enqueued again. The row stays, with who
- * decided and why, because the reservation happening at all is a fact about the
- * month.
+ * Three things happen in one statement, which is the point:
+ *
+ *   * cost_usd goes to zero, so the month gets the pessimistic estimate back.
+ *   * reservation_key goes to NULL, which frees the work identity. The unique
+ *     index is partial on `reservation_key IS NOT NULL`, so the next attempt
+ *     at the same extraction inserts a fresh reservation rather than colliding
+ *     with this row.
+ *   * released_reservation_key takes the value the key had, so the row still
+ *     says which work it claimed. Write-once in the database (migration 009):
+ *     the release is evidence, and evidence that can be rewritten is not.
+ *
+ * The row itself stays, with who decided and why, because the reservation
+ * happening at all is a fact about the month.
  *
  * Deliberately not automatic. Only the provider's billing can say whether an
  * ambiguous call was charged, and nothing in this process can see it.
@@ -553,27 +573,48 @@ export async function abandonReservation(
   callId: string,
   by: string,
   note: string,
-): Promise<boolean> {
-  const { rowCount } = await db.query(
+): Promise<ReservationRelease | undefined> {
+  const { rows } = await db.query<{
+    id: string;
+    released_reservation_key: string | null;
+    job_id: string | null;
+    estimated_cost_usd: string | null;
+  }>(
     `UPDATE llm_calls
-        SET status              = 'abandoned',
-            cost_usd            = 0,
-            reservation_key     = NULL,
-            finalized_at        = now(),
-            reconciled_by       = $2,
-            reconciliation_note = $3
-      WHERE id = $1 AND status = 'reserved'`,
+        SET status                   = 'abandoned',
+            cost_usd                 = 0,
+            released_reservation_key = coalesce(released_reservation_key, reservation_key),
+            reservation_key          = NULL,
+            finalized_at             = now(),
+            reconciled_by            = $2,
+            reconciliation_note      = $3
+      WHERE id = $1 AND status = 'reserved'
+      RETURNING id, released_reservation_key, job_id, estimated_cost_usd`,
     [callId, by, note],
   );
-  return rowCount === 1;
+
+  const row = rows[0];
+  if (row === undefined) {
+    return undefined;
+  }
+  return {
+    callId: row.id,
+    releasedKey: row.released_reservation_key,
+    jobId: row.job_id,
+    releasedUsd: Number(row.estimated_cost_usd ?? 0),
+  };
 }
 
 /**
  * Records that an ambiguous reservation *was* charged, at the stated cost.
  *
  * The other half of reconciliation, and the one that keeps the month honest:
- * the budget keeps the money. The reservation key is kept, so the work is not
- * silently retried against a provider that already answered.
+ * the budget keeps the money. The reservation key is kept — this statement does
+ * not mention `reservation_key` or `released_reservation_key` at all — so the
+ * work identity stays claimed and nothing silently retries a call the provider
+ * already answered and billed. Freeing it is a separate, deliberate act with a
+ * different name, which is the fail-closed direction: the accident is a retry
+ * that costs money twice, not a retry that never happens.
  */
 export async function confirmReservation(
   db: Queryable,

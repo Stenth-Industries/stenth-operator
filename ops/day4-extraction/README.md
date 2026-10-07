@@ -90,13 +90,37 @@ the timestamp shown, then resolve it:
 ```
 
 `abandoned` gives the budget back and frees the identity, so the work can be
-enqueued again. `charged` keeps the cost in the month and keeps the identity
+attempted again. `charged` keeps the cost in the month and keeps the identity
 taken, so the work is not retried against a provider that already answered.
 Both require `--by` and `--note`: a correction with no attribution is not an
 audit trail.
 
+Abandoning does three things in one statement, and prints each of them:
+
+| | |
+|---|---|
+| `cost_usd` → 0 | the month gets the pessimistic estimate back |
+| `reservation_key` → NULL | the work identity is free, so the next attempt can reserve it |
+| `released_reservation_key` ← the old key | the row still says which work it claimed, write-once (migration 009) |
+
+It then returns the blocked job that held the reservation to the queue, because
+freeing the identity on its own is not enough: §7 makes `web.extract`'s dedupe
+key permanent, so that job row is the only one that will ever exist for this
+snapshot — a fresh `enqueue` hits `ON CONFLICT` and reports success while
+changing nothing. `--no-requeue` leaves it blocked when you want to look first.
+The requeue keeps the job's id, its dedupe key and its attempt history, writes a
+`job.requeued` event carrying the `llm_calls` id behind the decision, and warns
+if the attempt budget is already spent.
+
+The same path is how a job blocked by `budget_hard_stop` or
+`provider_unconfigured` runs again once the ceiling is raised or a provider is
+configured. Requeueing is always a human's act: nothing in the worker undoes a
+terminal state.
+
 **There is no automatic path.** Replaying an ambiguous charged call is the one
-thing the reservation design exists to prevent.
+thing the reservation design exists to prevent — which is why `charged` does not
+mention `reservation_key` at all, and why `released_reservation_key` can never
+be set on a row that is still holding a key.
 
 ---
 

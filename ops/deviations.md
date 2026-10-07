@@ -207,3 +207,52 @@ and that is **not** a decision yet. `ops/day4-extraction/thresholds.ts` produces
 the comparison against the real corpus; the number changes in one constant when
 the data is in. Day 4 must not be deployed as the final gate until that table
 has been read.
+
+---
+
+# Final Day 4 review deviations
+
+Two further departures, both from the review of 2026-10-09, which asked for the
+abandoned-reservation retry path to be proven rather than described.
+
+## 11. `llm_calls` gains one more column: `released_reservation_key`
+
+Migration 007 released a work identity by setting `reservation_key` to NULL,
+which is what frees the retry — the unique index is partial on
+`reservation_key IS NOT NULL`. It also erased the one fact that made the
+abandoned row interpretable: which work the money had been held for. An audit
+row reading "released $0.09, by a person, with a note, for something" is not an
+audit trail, and §4 wants the ledger readable after the fact.
+
+Migration 009 therefore moves the key instead of dropping it. One nullable
+column, write-once through a `BEFORE UPDATE` trigger in the same style as 001's
+`approved_outreach_write_once`, deliberately **not** unique — the same work can
+be reserved and released more than once, and uniqueness would make the second
+honest abandonment fail and leave the budget held. Nothing reads it as a
+control: reservations still serialise on `reservation_key` alone.
+
+The trigger also refuses a row that records a release while still holding a
+key, so "held" and "handed back" can never both be true of one row.
+
+## 12. `blocked` is terminal, and now has one human-driven way back
+
+§6: "dead and blocked are terminal and raise an alert; nothing retries them
+silently." That is kept — nothing in the worker undoes a terminal state. But §7
+makes `web.extract`'s dedupe key permanent (`extract:<snapshot>:<version>`), so
+the blocked row is the only job row that will ever exist for that snapshot: a
+later `enqueue` hits `ON CONFLICT` and reports success while changing nothing.
+
+Taken together, those two rules made every control refusal permanent. An
+abandoned reservation freed its identity and its budget into a pipeline that
+would never ask for the work again, and the same held for a `budget_hard_stop`
+after the ceiling was raised and a `provider_unconfigured` after a provider was
+configured.
+
+`requeueBlockedJob` (`src/jobs/queue.ts`) is the one path back: guarded on
+`status = 'blocked'`, it returns the job to `queued` in place — same id, same
+dedupe key, `attempts` untouched so the blocked attempt is not erased — and
+writes a `job.requeued` event with `actor_type = 'human'` carrying the
+`llm_calls` id behind the decision. It is called by `reconcile.ts` after a
+successful abandonment and by nothing else. "Silently" is the word §6 turns on,
+and this is attributable, bounded by the original attempt budget, and never
+automatic.
