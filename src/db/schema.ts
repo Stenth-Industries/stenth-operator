@@ -187,6 +187,13 @@ export const webSnapshots = pgTable(
     fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
     textPrunedAt: timestamp('text_pruned_at', { withTimezone: true }),
     traceId: text('trace_id'),
+    /**
+     * The deterministic Tier A scan of the page markup (§9, migration 006).
+     *
+     * NULL means no scanner has looked, which extraction records as `unknown`
+     * rather than `absent` — §10 pays for absence, so the two are not the same.
+     */
+    signals: jsonb('signals'),
     createdAt: createdAt(),
   },
   (table) => [

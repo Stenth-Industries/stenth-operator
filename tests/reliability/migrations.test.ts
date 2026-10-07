@@ -109,6 +109,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '003_scheduler_heartbeat.sql',
       '004_fetcher_snapshot_grants.sql',
       '005_snapshot_text_requires_2xx.sql',
+      '006_snapshot_signals.sql',
     ]);
     expect(result.skipped).toStrictEqual([]);
   });
@@ -122,6 +123,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
       '003_scheduler_heartbeat.sql',
       '004_fetcher_snapshot_grants.sql',
       '005_snapshot_text_requires_2xx.sql',
+      '006_snapshot_signals.sql',
     ]);
   });
 
@@ -137,6 +139,7 @@ describeWithDb('migrations on a fresh database (SPEC.md §25 Day 1)', () => {
         '003_scheduler_heartbeat.sql',
         '004_fetcher_snapshot_grants.sql',
       '005_snapshot_text_requires_2xx.sql',
+      '006_snapshot_signals.sql',
       ]) {
         await client.query(readFileSync(join(migrationsDir, file), 'utf8'));
       }

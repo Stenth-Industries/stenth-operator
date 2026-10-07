@@ -85,3 +85,77 @@ compromise of Operator yields a mail credential. The host is a shared box whose
 other tenant can.*
 
 No action requested. Recorded so the claim is not overstated later.
+
+---
+
+# Day 4 deviations from the frozen specification
+
+Four small departures, each with the reason and the alternative that was
+rejected. None changes the architecture, the pipeline or a control.
+
+## 4. `web_snapshots.signals` is a column §4 does not list
+
+**§9** says every Tier A signal is "read out of stored HTML by code, not
+inferred by a model", and **§23 case 13** says the scanner "reads script
+content, not claims". The `AW-` identifier lives inside a `<script>`, and the
+fetcher's HTML-to-text step drops `<script>` — correctly, because that is where
+injected instructions live (§8). By the time a page is in `web_snapshots.text`
+the evidence for the most useful Tier A signal is gone.
+
+Migration 006 adds a nullable `jsonb` column and the fetcher writes the
+deterministic scan into it before the text conversion. Rejected alternatives:
+storing the raw HTML as well (doubles storage, puts hostile markup in the
+database, gives §15 a second copy to prune) and re-fetching at extract time (a
+second request for data we already had, and the page can change in between).
+
+§4 names "key columns and constraints" rather than an exhaustive list, the
+column is additive and nullable, and it belongs with the snapshot because it
+shares its provenance, trace id and retention. A separate table would have been
+a larger departure for no benefit.
+
+**Consequence worth knowing:** the 20 snapshots stored during Day 3 have
+`signals` NULL. Extraction records Tier A as `unknown` for them, not `absent`.
+Day 6's rubric must treat `unknown` as "no evidence" — awarding the Visible
+execution gap's 35 points for a signal nobody measured would be the Day 3
+finding-1 mistake in a new place. One re-fetch pass of the 20 sites after
+deployment gives Day 6 real signals; it costs 40 polite requests and no model
+spend.
+
+## 5. `paid_search_tag` has a third value, `unknown`
+
+§9 says "Extraction records paid_search_tag enum(present, absent)". Two values
+cannot express "no scanner has looked", and the only honest answer for a
+pre-006 snapshot is neither present nor absent. Collapsing it to `absent` would
+hand §10's largest dimension its full 35 points on no evidence; collapsing it to
+`present` would be worse.
+
+So the recorded enum is `present | absent | unknown`, and only the scanner may
+say `absent`, because only the scanner has looked. §9's own rule — "Anything
+outside Tier A is recorded as unknown and never estimated" — is the principle
+this follows; the deviation is that one Tier A field can also be unknown, for
+the specific reason that the scan is newer than some of the snapshots.
+
+## 6. `blocked` covers one more case than §6 names
+
+§6 introduces `blocked` as the state "when the budget ceiling is hit". Day 4
+also moves a job to `blocked` when the configured provider is billable and
+`MODEL_CALLS_ENABLED` is not set.
+
+It is the same kind of event — a control refused the job before any provider was
+contacted — and `blocked` is already terminal and alerting, which is the correct
+behaviour: neither a ceiling nor a switch improves by being retried. The
+alternative, failing three times into `dead`, would describe a configuration
+decision as a fault.
+
+## 7. `src/pipeline/evidence.ts` is a file §19 does not list
+
+§19's tree lists `pipeline/ discover.ts, qualify.ts, rank.ts, outreach.ts,
+priors.ts`. The snapshot eligibility gate sits between §10's stage 3 (fetch) and
+stage 4 (extract) and belongs to neither `qualify.ts` nor the handler: it is the
+rule that decides whether a paid call happens, and it has to be unit-testable
+without a database or a provider.
+
+§19's five rules forbid a new top-level directory without a written reason and
+an abstraction with a single caller. This is neither — `pipeline/` already
+exists, and the gate has two callers already (the handler and the SQL mirror
+test) with Day 5's `company.resolve` to come.

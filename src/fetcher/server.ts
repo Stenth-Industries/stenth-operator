@@ -24,6 +24,7 @@ import { htmlToText, plainToText } from '../fetch/html-to-text';
 import { HostPoliteness } from '../fetch/politeness';
 import { FROZEN_POLICY, type FetchPolicy } from '../fetch/policy';
 import { decide, parseRobots, RobotsCache } from '../fetch/robots';
+import { scanTierASignals, type TierASignals } from '../fetch/signals';
 import { getLogger, withTrace } from '../obs/log';
 import { adoptTraceId } from '../obs/trace';
 import {
@@ -322,6 +323,16 @@ export async function fetchAndStore(
     };
   }
 
+  // --- the deterministic Tier A scan, before the markup is thrown away ---
+  //
+  // §9's signals are read out of the HTML by code, and §23 case 13 says the
+  // scanner reads script content rather than claims. htmlToText drops <script>
+  // next, which is where the AW- identifier lives — so this is the only moment
+  // the evidence exists. No model, no network, no credential: regular
+  // expressions over markup, producing booleans, counts and identifiers.
+  const signals =
+    outcome.contentType === 'text/plain' ? undefined : scanTierASignals(outcome.body);
+
   // --- untrusted content becomes text, then a row ---
   const extracted =
     outcome.contentType === 'text/plain'
@@ -338,6 +349,7 @@ export async function fetchAndStore(
     bytes: outcome.bytes,
     robotsAllowed: true,
     traceId: input.traceId,
+    signals,
   });
 
   log.info(
@@ -420,12 +432,15 @@ async function storeSnapshot(
     bytes: number | undefined;
     robotsAllowed: boolean;
     traceId: string;
+    /** The Tier A scan, for a 2xx HTML page. Absent means no scan happened. */
+    signals?: TierASignals | undefined;
   },
 ): Promise<string | undefined> {
   const inserted = await pool.query<{ id: string }>(
     `INSERT INTO web_snapshots
-       (company_id, url, http_status, content_hash, text, bytes, robots_allowed, trace_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (company_id, url, http_status, content_hash, text, bytes, robots_allowed,
+        trace_id, signals)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
      ON CONFLICT (company_id, url, content_hash) DO NOTHING
      RETURNING id`,
     [
@@ -437,6 +452,7 @@ async function storeSnapshot(
       snapshot.bytes ?? null,
       snapshot.robotsAllowed,
       snapshot.traceId,
+      snapshot.signals === undefined ? null : JSON.stringify(snapshot.signals),
     ],
   );
 

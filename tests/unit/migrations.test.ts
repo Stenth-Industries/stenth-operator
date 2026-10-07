@@ -269,3 +269,36 @@ describe('migration 005: page text requires a 2xx (§8, §9)', () => {
     expect(statements).not.toMatch(/usable_snapshots TO PUBLIC/i);
   });
 });
+
+/**
+ * Migration 006: the Tier A scan lives with the snapshot.
+ *
+ * §9's signals are read out of the HTML by code, and the HTML is gone by the
+ * time a snapshot is stored — html-to-text drops <script>, which is where the
+ * AW- identifier lives. The column is where the deterministic scan lands.
+ */
+describe('migration 006: web_snapshots.signals (§9, §23 case 13)', () => {
+  const sql = readFileSync(join(migrationsDir, '006_snapshot_signals.sql'), 'utf8');
+  const statements = statementsOnly(sql);
+
+  it('adds one nullable jsonb column, idempotently', () => {
+    expect(statements).toMatch(/ADD COLUMN IF NOT EXISTS signals jsonb/);
+    expect(statements).not.toMatch(/NOT NULL/);
+  });
+
+  it('changes nothing else: no new table, no dropped object, no grant change', () => {
+    expect(statements).not.toMatch(/CREATE TABLE/i);
+    expect(statements).not.toMatch(/\bDROP\b/i);
+    expect(statements).not.toMatch(/\bDELETE\b/i);
+    expect(statements).not.toMatch(/\bGRANT\b/i);
+    expect(statements).not.toMatch(/\bREVOKE\b/i);
+  });
+
+  it('leaves the usable_snapshots view alone', () => {
+    // Replacing it here would make migration 005 non-re-runnable: CREATE OR
+    // REPLACE VIEW cannot drop a column, so 005's older definition would fail
+    // against the newer view — and 005 is applied in production, where editing
+    // it is not an option (§19 rule 3).
+    expect(statements).not.toMatch(/usable_snapshots/);
+  });
+});

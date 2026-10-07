@@ -227,6 +227,79 @@ export async function failJob(
   }
 }
 
+/**
+ * Thrown by a handler when a control refused the job before any external work.
+ *
+ * The worker loop moves a job that throws this to `blocked` rather than
+ * `failed`, because §6 makes blocked terminal and alerting: a budget ceiling is
+ * not a transient fault and retrying it three times achieves nothing but noise.
+ * The loop recognises the base class, so handlers can carry their own reasons
+ * without the loop knowing any of them.
+ */
+export class ControlRefusal extends Error {
+  override readonly name: string = 'ControlRefusal';
+
+  constructor(
+    readonly reason: string,
+    detail: string,
+  ) {
+    super(detail);
+  }
+}
+
+/**
+ * Moves a job to blocked: a control refused it before any external work.
+ *
+ * §6: "blocked when the budget ceiling is hit. dead and blocked are terminal
+ * and raise an alert; nothing retries them silently." §16 is the reason it
+ * exists — the budget check runs before the call, so a job that would cross the
+ * ceiling never contacts the provider and never consumes an attempt's worth of
+ * retries either. It is terminal, so a human raises the ceiling or the month
+ * rolls over; the queue does not keep asking.
+ *
+ * Also used when model calls are disabled in configuration, which is the same
+ * kind of event: a control stopped the job before the provider was reached.
+ */
+export async function blockJob(
+  pool: Pool,
+  job: ClaimedJob,
+  reason: string,
+  detail: string,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE job_runs SET finished_at = now(), status = 'failed', error = $3
+       WHERE job_id = $1 AND attempt = $2`,
+      [job.id, job.attempts, detail.slice(0, MAX_ERROR_LENGTH)],
+    );
+
+    await client.query(
+      `UPDATE jobs SET status = 'blocked', locked_at = NULL, locked_by = NULL,
+                       last_error = $2, updated_at = now()
+       WHERE id = $1`,
+      [job.id, detail.slice(0, MAX_ERROR_LENGTH)],
+    );
+
+    // Ids, a kind and a machine reason. No detail text: events is the audit
+    // spine and carries no copied prose (§16).
+    await client.query(
+      `INSERT INTO events (entity_type, entity_id, kind, actor_type, payload, trace_id)
+       VALUES ('job', $1, 'job.blocked', 'system', $2::jsonb, $3)`,
+      [job.id, JSON.stringify({ job_kind: job.kind, reason, attempt: job.attempts }), job.trace_id],
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /** Thrown when a claimed job has no registered handler. */
 export class UnregisteredKindError extends Error {
   override readonly name = 'UnregisteredKindError';

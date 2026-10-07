@@ -85,6 +85,22 @@ const envSchema = z.object({
    * V1 starts deliberately conservative: $50/month, warning at $35, hard stop
    * at $50, sized to 20-40 discovered and 10-15 assessed prospects a day.
    */
+  /**
+   * The runtime model provider id (§1, §22).
+   *
+   * Deliberately optional and without a default. §1 freezes "one runtime
+   * provider, chosen by eval on Day 6", so a deployment that has not made that
+   * decision must fail when it tries to extract — not inherit whichever
+   * adapter happened to be imported first.
+   */
+  MODEL_PROVIDER: z.string().min(1).optional(),
+
+  /** The model credential (§17). Never logged, never in a committed file. */
+  MODEL_CALLS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+
   AI_BUDGET_MONTHLY_USD: z.coerce.number().nonnegative().default(50),
   AI_BUDGET_WARN_USD: z.coerce.number().nonnegative().default(35),
   AI_BUDGET_HARD_STOP_USD: z.coerce.number().nonnegative().default(50),

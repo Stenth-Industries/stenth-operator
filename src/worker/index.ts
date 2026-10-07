@@ -16,9 +16,19 @@ import type { Pool } from 'pg';
 
 import { getConfig } from '../config';
 import { createPool } from '../db/client';
-import { claimJob, completeJob, failJob, UnregisteredKindError } from '../jobs/queue';
+import {
+  blockJob,
+  claimJob,
+  completeJob,
+  failJob,
+  ControlRefusal,
+  UnregisteredKindError,
+} from '../jobs/queue';
 import { getLogger, withTrace } from '../obs/log';
 import { getHandler, registerHandler } from './handlers';
+import { resolveProvider, type ModelProvider } from '../ai/provider';
+import { registerAvailableProviders } from '../ai/providers';
+import { handleWebExtract } from './handlers/web-extract';
 import { handleWebFetch } from './handlers/web-fetch';
 import { reap, DEFAULT_STALE_AFTER_SECONDS } from './reaper';
 import { tick } from './scheduler';
@@ -110,6 +120,24 @@ export async function runOnce(
       'job succeeded',
     );
   } catch (error) {
+    if (error instanceof ControlRefusal) {
+      // §6: blocked is terminal and raises an alert. No attempt is consumed
+      // retrying something a control has already decided.
+      await blockJob(appPool, job, error.reason, error.message);
+      log.error(
+        {
+          job_id: job.id,
+          job_kind: job.kind,
+          attempt: job.attempts,
+          reason: error.reason,
+          duration_ms: Date.now() - startedAt,
+          err: error,
+        },
+        'ALERT: job blocked by a control; it will not retry',
+      );
+      return 'ran';
+    }
+
     const outcome = await failJob(appPool, job, error);
     const line = {
       job_id: job.id,
@@ -218,7 +246,7 @@ async function main(): Promise<void> {
     );
   }
 
-  // Day 3 registers one handler. The worker never fetches anything itself: it
+  // Day 3 registers web.fetch. The worker never fetches anything itself: it
   // asks the fetcher, which is the only process that touches hostile input.
   const fetcherUrl = config.FETCHER_URL;
   const sharedSecret = config.FETCHER_SHARED_SECRET;
@@ -227,6 +255,37 @@ async function main(): Promise<void> {
   });
 
   const appPool = createPool(config.DATABASE_URL);
+
+  // Day 4 registers web.extract. The provider is resolved once, at boot, and
+  // resolveProvider throws when MODEL_PROVIDER is unset — §1 freezes the choice
+  // of runtime provider to the Day 6 evaluation, so a deployment that has not
+  // made that decision must not quietly inherit one. The handler is registered
+  // only when a provider exists; without one, a web.extract job fails through
+  // the ordinary unregistered-kind path, visibly.
+  registerAvailableProviders();
+  let provider: ModelProvider | undefined;
+  try {
+    provider = resolveProvider(config.MODEL_PROVIDER);
+  } catch (error) {
+    log.warn(
+      { err: error },
+      'no model provider is configured: web.extract is not registered (§1, §22)',
+    );
+  }
+  if (provider !== undefined) {
+    const resolved = provider;
+    registerHandler('web.extract', async (job) => {
+      await handleWebExtract(job, {
+        pool: appPool,
+        provider: resolved,
+        modelCallsEnabled: config.MODEL_CALLS_ENABLED,
+      });
+    });
+    log.info(
+      { provider: resolved.id, model: resolved.model, billable: resolved.billable },
+      'web.extract registered',
+    );
+  }
   const schedPool = createPool(config.SCHED_DATABASE_URL);
   const workerId = `${hostname()}:${process.pid}`;
 
