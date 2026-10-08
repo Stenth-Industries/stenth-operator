@@ -164,9 +164,9 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     // only the privileged zone can read it.
     expect(JSON.stringify(result)).not.toContain('page at');
     expect(Object.keys(result).sort()).toStrictEqual([
-      'extractableSnapshotIds', 'extractsEnqueued', 'followUpsDiscovered',
-      'followUpsEnqueued', 'httpError', 'httpUnavailable', 'refused',
-      'robotsDisallowed', 'stored',
+      'extractableSnapshotIds', 'extractsEnqueued', 'followUpBasis',
+      'followUpsDiscovered', 'followUpsEnqueued', 'httpError', 'httpUnavailable',
+      'refused', 'robotsDisallowed', 'stored',
     ]);
   }, 60_000);
 

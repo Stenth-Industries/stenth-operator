@@ -26,6 +26,7 @@ import { dedupeKey, fetchUrlHash, todayUtc } from '../../jobs/kinds';
 import type { ClaimedJob } from '../../jobs/queue';
 import { withTrace } from '../../obs/log';
 import { TRACE_HEADER } from '../../obs/trace';
+import { isFirstPartyUrl } from '../../pipeline/domain';
 import { safeFirstPartyUrl } from '../../pipeline/links';
 import {
   classifyPageKind,
@@ -120,7 +121,41 @@ export interface WebFetchResult {
   readonly followUpsEnqueued: number;
   /** How many of those came from the harvest rather than a conventional path. */
   readonly followUpsDiscovered: number;
+  /** Why the fan-out did what it did. The audit answer to "where did these come from". */
+  readonly followUpBasis: FollowUpBasis;
 }
+
+/**
+ * What the homepage job's own outcome made of §10 stage 3's second wave.
+ *
+ *   not_eligible       Not the homepage job, or a job carrying more than one
+ *                      URL, so there is no single homepage outcome to read.
+ *   homepage_read      The homepage was stored. Discovered URLs are preferred,
+ *                      conventional paths fill the kinds it did not link.
+ *   terminal_fallback  The homepage answered no, and the answer is final — a
+ *                      4xx, or a robots Disallow. The firm does not end there:
+ *                      the five conventional paths are enqueued instead.
+ *   exhausted_fallback A guard refused the homepage and the job has no attempts
+ *                      left, so no later attempt can discover anything. Same
+ *                      five conventional paths.
+ *   retry_pending      A guard refused it and attempts remain. Nothing is
+ *                      enqueued yet, deliberately: see the note below.
+ *   no_answer          5xx, or any other status that is neither 2xx nor 4xx.
+ *                      The site gave no answer, so §6's retry is the answer and
+ *                      asking five more URLs of it would be load, not fallback.
+ *   off_domain         The final URL left the firm's registrable domain. The
+ *                      firm's site is not at the firm's domain, which §10 calls
+ *                      parked, and a parked domain does not get to nominate
+ *                      pages.
+ */
+export type FollowUpBasis =
+  | 'not_eligible'
+  | 'homepage_read'
+  | 'terminal_fallback'
+  | 'exhausted_fallback'
+  | 'retry_pending'
+  | 'no_answer'
+  | 'off_domain';
 
 /**
  * Asks the fetcher for one page.
@@ -173,6 +208,8 @@ export async function handleWebFetch(
   let refused = 0;
   let retryable = 0;
   const extractableSnapshotIds: string[] = [];
+  /** Kept so the fan-out can read the homepage's own outcome, not just a count. */
+  const outcomes: FetchResponse[] = [];
 
   for (const url of payload.urls) {
     const result = await requestOne(deps, {
@@ -180,6 +217,7 @@ export async function handleWebFetch(
       url,
       trace_id: job.trace_id,
     });
+    outcomes.push(result);
 
     if (isRetryable(result.outcome)) {
       retryable += 1;
@@ -243,10 +281,11 @@ export async function handleWebFetch(
   // §10 stage 3's second wave. Only the homepage job runs it: it is the only
   // job that has seen what the firm's own homepage links to, and a discovered
   // page fanning out again would make the six-page ceiling unenforceable.
-  const followUps =
-    payload.page_kind === 'home' && extractableSnapshotIds.length > 0
-      ? await fanOutFromHomepage(job, payload, extractableSnapshotIds[0] as string, deps)
-      : { enqueued: 0, discovered: 0 };
+  //
+  // It runs whatever the homepage's outcome was, because a homepage that
+  // refuses us is not a reason to abandon the firm — only a reason to stop
+  // asking the homepage. What changes is where the five URLs come from.
+  const followUps = await fanOutFromHomepage(job, payload, outcomes, deps);
 
   log.info(
     {
@@ -260,6 +299,7 @@ export async function handleWebFetch(
       extracts_enqueued: extractsEnqueued,
       follow_ups_enqueued: followUps.enqueued,
       follow_ups_discovered: followUps.discovered,
+      follow_up_basis: followUps.basis,
     },
     'web.fetch complete',
   );
@@ -288,23 +328,52 @@ export async function handleWebFetch(
     extractsEnqueued,
     followUpsEnqueued: followUps.enqueued,
     followUpsDiscovered: followUps.discovered,
+    followUpBasis: followUps.basis,
   };
 }
 
 /**
  * Chooses and enqueues the five pages that follow the homepage.
  *
+ * ## Two sources, one shape
+ *
+ * When the homepage was read, its own links decide: `selectFollowUpPages`
+ * prefers a discovered URL per page kind and falls back to a conventional path
+ * for the kinds it did not link. When the homepage refused us, there is nothing
+ * to prefer, so all five are conventional paths. Either way it is five URLs, one
+ * job each, `page_source` on every payload saying which it was.
+ *
+ * A homepage that answers 403 is not a reason to abandon the firm. It is a
+ * reason to stop asking *the homepage*: a site with a blocked root and a
+ * perfectly readable `/about` is ordinary, and Day 3's correction was about not
+ * re-asking a URL that has already answered, not about giving up on a company.
+ *
+ * ## Why a retryable refusal waits
+ *
+ * A guard refusal and a 5xx are retryable, and fanning out while an attempt
+ * remains would be unsound rather than merely eager: the retry could then store
+ * the homepage, discovery would run, and the discovered URLs would be *added*
+ * to five fallbacks already queued. One firm, eleven pages, §10's ceiling gone.
+ * So a refusal fans out only once the homepage has no attempts left — at which
+ * point no later attempt can discover anything — and a 5xx never does, because
+ * "the site gave no answer" is answered by §6's retry, and asking five more
+ * URLs of a server returning 500s is load, not fallback.
+ *
  * ## The trust step, which is the point of this function
  *
  * The candidate list was produced by the fetcher — the process whose job is
  * handling hostile input — from attacker-controlled markup. The worker already
- * refuses to believe that process's HTTP reply without parsing it; believing
- * its stored output would be the same mistake with a database in between. So
- * every candidate is run through `safeFirstPartyUrl` again here, and against
+ * refuses to believe that process's HTTP reply without parsing it; believing its
+ * stored output would be the same mistake with a database in between. So every
+ * candidate is run through `safeFirstPartyUrl` again here, and against
  * `companies.canonical_domain` this time rather than the page's own final URL:
  * a redirect could have moved the snapshot, and §4 makes the canonical domain
  * the firm's identity. The page kind is re-derived too, so a mislabelled
  * candidate is reclassified rather than trusted.
+ *
+ * Every URL that becomes a job passes that same filter, fallbacks included.
+ * They are constructed from the canonical domain, so they pass by construction
+ * — which is exactly why checking them costs nothing and proves it.
  *
  * In other words the fetcher's filter is a courtesy that keeps junk out of the
  * database. This is the one that decides what gets fetched.
@@ -312,39 +381,96 @@ export async function handleWebFetch(
 async function fanOutFromHomepage(
   job: ClaimedJob,
   payload: z.infer<typeof webFetchPayloadSchema>,
-  snapshotId: string,
+  outcomes: readonly FetchResponse[],
   deps: WebFetchDeps,
-): Promise<{ enqueued: number; discovered: number }> {
+): Promise<{ enqueued: number; discovered: number; basis: FollowUpBasis }> {
   const log = withTrace(job.trace_id);
+  const nothing = (basis: FollowUpBasis) => ({ enqueued: 0, discovered: 0, basis });
+  // §7's occurrence, carried from the homepage job so all six pages of one firm
+  // share one date rather than splitting across midnight.
   const occurrence = payload.occurrence ?? deps.occurrence ?? todayUtc();
 
-  const { rows } = await deps.pool.query<{
-    canonical_domain: string;
-    page_links: unknown;
-  }>(
-    `SELECT c.canonical_domain::text AS canonical_domain, s.signals -> 'page_links' AS page_links
-       FROM web_snapshots s
-       JOIN companies c ON c.id = s.company_id
-      WHERE s.id = $1`,
-    [snapshotId],
-  );
-  const row = rows[0];
-  if (row === undefined) {
-    throw new Error(`web_snapshots ${snapshotId} vanished between storing and reading it back`);
+  // One homepage, one outcome. A hand-enqueued job carrying several URLs has no
+  // single homepage result to read, so it does not fan out.
+  const home = outcomes.length === 1 ? outcomes[0] : undefined;
+  if (payload.page_kind !== 'home' || home === undefined) {
+    return nothing('not_eligible');
   }
 
-  const discovered = revalidateCandidates(row.page_links, row.canonical_domain);
-  const pages = selectFollowUpPages(row.canonical_domain, discovered);
+  const { rows } = await deps.pool.query<{ canonical_domain: string }>(
+    'SELECT canonical_domain::text AS canonical_domain FROM companies WHERE id = $1',
+    [payload.company_id],
+  );
+  const canonicalDomain = rows[0]?.canonical_domain;
+  if (canonicalDomain === undefined) {
+    throw new Error(`companies ${payload.company_id} does not exist`);
+  }
+
+  // Where the homepage actually ended up. A redirect off the firm's registrable
+  // domain means the firm's site is not at the firm's domain — §10's "dead,
+  // parked or under construction" — and a parked domain does not get to
+  // nominate pages, nor does it earn five guesses at the domain it left.
+  // src/pipeline/domain.ts: not company evidence "until company.resolve
+  // separately verifies that the other domain belongs to the same firm".
+  const observed = home.final_url ?? payload.urls[0] ?? '';
+  if (!isFirstPartyUrl(observed, canonicalDomain).sameFirm) {
+    log.warn(
+      { company_id: payload.company_id, canonical_domain: canonicalDomain },
+      'the homepage ended on another registrable domain; not fanning out',
+    );
+    return nothing('off_domain');
+  }
+
+  const storedHomepage =
+    home.outcome === 'stored' && home.snapshot_id !== undefined ? home.snapshot_id : undefined;
+
+  let discovered: DiscoveredLink[] = [];
+  let basis: FollowUpBasis;
+
+  if (storedHomepage !== undefined) {
+    discovered = revalidateCandidates(
+      await readHarvest(deps, storedHomepage),
+      canonicalDomain,
+    );
+    basis = 'homepage_read';
+  } else if (home.outcome === 'robots_disallowed' || home.outcome === 'http_error') {
+    // Final. The five conventional paths are enqueued, and each one does its
+    // own robots check in the fetcher — so a blanket `Disallow: /` costs one
+    // cached robots.txt and five text-free rows, not five fetches.
+    basis = 'terminal_fallback';
+  } else if (home.outcome === 'http_unavailable') {
+    return nothing('no_answer');
+  } else if (job.attempts >= job.max_attempts) {
+    basis = 'exhausted_fallback';
+  } else {
+    return nothing('retry_pending');
+  }
+
+  const pages = selectFollowUpPages(canonicalDomain, discovered);
 
   let enqueued = 0;
+  let discoveredPages = 0;
   for (const page of pages) {
+    // The last gate before a URL becomes a request, applied to discovered and
+    // conventional alike.
+    const verdict = safeFirstPartyUrl(page.url, base(canonicalDomain), canonicalDomain);
+    if (!verdict.ok) {
+      log.warn(
+        { page_kind: page.kind, reason: verdict.reason },
+        'a planned page failed the first-party filter and was dropped',
+      );
+      continue;
+    }
+    if (page.source === 'discovered') {
+      discoveredPages += 1;
+    }
     const { inserted } = await enqueue(deps.pool, {
       kind: 'web.fetch',
-      dedupeKey: dedupeKey.webFetch(payload.company_id, fetchUrlHash([page.url]), occurrence),
+      dedupeKey: dedupeKey.webFetch(payload.company_id, fetchUrlHash([verdict.url]), occurrence),
       traceId: job.trace_id,
       payload: {
         company_id: payload.company_id,
-        urls: [page.url],
+        urls: [verdict.url],
         page_kind: page.kind,
         page_source: page.source,
         occurrence,
@@ -359,18 +485,33 @@ async function fanOutFromHomepage(
   log.info(
     {
       company_id: payload.company_id,
-      canonical_domain: row.canonical_domain,
+      canonical_domain: canonicalDomain,
+      basis,
       harvest_candidates: discovered.length,
       follow_ups_enqueued: enqueued,
-      discovered_pages: pages.filter((page) => page.source === 'discovered').length,
+      discovered_pages: discoveredPages,
     },
     'the homepage chose the remaining pages',
   );
 
-  return {
-    enqueued,
-    discovered: pages.filter((page) => page.source === 'discovered').length,
-  };
+  return { enqueued, discovered: discoveredPages, basis };
+}
+
+/** The firm's own root, as the base relative candidates resolve against. */
+function base(canonicalDomain: string): URL {
+  return new URL(`https://${canonicalDomain}/`);
+}
+
+/** The stored harvest for one snapshot, as written by the fetcher. */
+async function readHarvest(deps: WebFetchDeps, snapshotId: string): Promise<unknown> {
+  const { rows } = await deps.pool.query<{ page_links: unknown }>(
+    `SELECT signals -> 'page_links' AS page_links FROM web_snapshots WHERE id = $1`,
+    [snapshotId],
+  );
+  if (rows[0] === undefined) {
+    throw new Error(`web_snapshots ${snapshotId} vanished between storing and reading it back`);
+  }
+  return rows[0].page_links;
 }
 
 /**
@@ -395,9 +536,9 @@ function revalidateCandidates(stored: unknown, canonicalDomain: string): Discove
     return [];
   }
 
-  let base: URL;
+  let root: URL;
   try {
-    base = new URL(`https://${canonicalDomain}/`);
+    root = base(canonicalDomain);
   } catch {
     return [];
   }
@@ -415,7 +556,7 @@ function revalidateCandidates(stored: unknown, canonicalDomain: string): Discove
       continue;
     }
 
-    const verdict = safeFirstPartyUrl(candidate, base, canonicalDomain);
+    const verdict = safeFirstPartyUrl(candidate, root, canonicalDomain);
     if (!verdict.ok) {
       continue;
     }

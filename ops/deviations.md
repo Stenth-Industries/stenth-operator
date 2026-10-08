@@ -469,13 +469,10 @@ that writes the company, and give the worker a second route to the fetcher. §6'
 chain is company.resolve → web.fetch → web.extract, and adding a job kind to
 avoid that is a specification change to a frozen table.
 
-**A consequence worth stating plainly.** If the homepage cannot be read — a 4xx,
-or a robots `Disallow` on `/` — there is no harvest and no fan-out, so the firm
-gets one request and no further pages. That is deliberate: asking a site five
-more times after it has just refused the homepage is what Day 3's finding argued
-against. Previously `company.resolve` enqueued all six regardless, so a firm
-whose `/` returned 403 but whose `/about` worked would have been read anyway.
-That case is now lost, and the trade is one unwanted request against five.
+**A consequence, now reversed — see deviation 21.** As first built, a homepage
+that could not be read ended the firm at one request. That lost the firm whose
+`/` returns 403 and whose `/about` is perfectly readable, and it was reversed on
+the same day it was recorded.
 
 **`page_source` is the new provenance.** Every web.fetch payload now says
 whether its URL is the `root`, `discovered` from the homepage, or a `fallback`
@@ -483,3 +480,72 @@ guess, and the occurrence is carried so all six pages of one firm share one §7
 date rather than splitting across midnight. Deviation 15's open question — what
 a firm actually calls its about page — is now answerable from the data instead
 of guessed, and the fallback paths remain for the kinds a homepage does not link.
+
+## 21. A homepage that refuses us falls back; it does not end the firm
+
+Deviation 20 recorded that a terminal homepage outcome produced no fan-out at
+all. Reversed on request, 2026-10-08, before deployment.
+
+A site with a blocked root and a readable `/about` is ordinary. Day 3's
+correction was about never re-asking a URL that has already answered — a 403
+does not become a 200 by asking twice more — and that is kept exactly: the
+homepage URL is asked once and never again. It was never an argument for
+abandoning the company.
+
+So when the homepage job finishes with no usable snapshot, the five conventional
+paths are enqueued instead of the five discovered ones. Same shape either way:
+one `web.fetch` job per URL, `page_source: 'fallback'` on every payload, the
+§7 occurrence carried so all six share one date, and `selectFollowUpPages`
+looping over the page kinds rather than the candidates so the total cannot pass
+§10's six. Every URL — discovered or conventional — passes `safeFirstPartyUrl`
+against `companies.canonical_domain` as the last gate before it becomes a job.
+
+**Which outcomes fall back, and why the other two do not.** The handler now
+reports a `followUpBasis`, which is the audit answer to "where did these five
+come from":
+
+| Homepage outcome | Basis | Fan-out |
+|---|---|---|
+| 2xx stored | `homepage_read` | discovered preferred, conventional fills the rest |
+| 4xx (401/403/404/429) | `terminal_fallback` | five conventional paths |
+| robots `Disallow` | `terminal_fallback` | five conventional paths |
+| guard refusal, attempts left | `retry_pending` | none yet |
+| guard refusal, last attempt | `exhausted_fallback` | five conventional paths |
+| 5xx or other non-2xx/4xx | `no_answer` | none |
+| final URL off the firm's domain | `off_domain` | none |
+
+A guard refusal is retryable under §6, and fanning out while an attempt remained
+would be **unsound**, not merely eager: the retry could then store the homepage,
+discovery would run, and the discovered URLs would be *added* to five fallbacks
+already queued — one firm, eleven pages, the ceiling gone. So it waits until the
+homepage has no attempts left, at which point no later attempt can discover
+anything. A reliability case drives exactly that sequence and asserts six.
+
+A 5xx never falls back. "The site gave no answer" is what §6's bounded retry
+exists for, and asking five more URLs of a server returning 500s is load, not
+fallback. That behaviour is unchanged from Day 3.
+
+**The robots case costs one request, not five.** Each fallback job does its own
+robots check inside the fetcher, and `robots_cache` holds the file for 24 hours,
+so a blanket `Disallow: /` produces one cached robots.txt and five text-free
+rows — no fetches. A narrower `Disallow: /$` blocks only the root, which is
+precisely the case this reversal exists to serve.
+
+**The off-domain guard is new, and it applies to the successful path too.** If
+the homepage's final URL left the firm's registrable domain, nothing is fanned
+out at all: not the discovered URLs, which are off-domain by definition, and not
+the conventional ones either. §10 calls that site parked, the snapshot is
+already ineligible for extraction (`off_domain_final_url` in
+`src/pipeline/evidence.ts`), and `src/pipeline/domain.ts` says such a domain is
+not company evidence "until company.resolve separately verifies that the other
+domain belongs to the same firm". A parked domain does not get to nominate
+pages, and it does not earn five guesses at the domain it left. A legitimate
+subdomain redirect — `firm.com.au` to `www.firm.com.au` — is the same firm and
+still fans out, which the Public Suffix List decides rather than a string
+comparison.
+
+This is the one part of the successful-homepage path that changed. Discovery
+preference is untouched.
+
+No model call, no provider choice, no migration, no new grant: the reversal is a
+branch in one handler function and five extra rows in the jobs table.
