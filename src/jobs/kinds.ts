@@ -102,6 +102,17 @@ export const dedupeKey = {
  * and the Day 3 acceptance harness must produce the same key for the same work
  * or a re-run would duplicate jobs instead of deduplicating them.
  */
+/**
+ * Today in UTC, as §7's `yyyy-mm-dd` occurrence.
+ *
+ * Here rather than in a handler because two handlers need the same answer: the
+ * occurrence a firm's six pages share is part of the key, not part of either
+ * stage.
+ */
+export function todayUtc(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
 export function fetchUrlHash(urls: readonly string[]): string {
   return createHash('sha256').update(urls.join('\n'), 'utf8').digest('hex').slice(0, 16);
 }

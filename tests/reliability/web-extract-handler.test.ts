@@ -225,6 +225,20 @@ describeWithDb('the web.extract handler (§6, §8, §16)', () => {
       expect(signals.contact_form).toBe('present');
       expect(signals.copyright_year).toBe(2026);
 
+      // And the link harvest, which shares the signals column, never travels
+      // into the extraction payload or towards a model: assembleSignals picks
+      // named Tier A keys, so a second deterministic read of the markup is
+      // invisible to it (§9's Tier A list is what the rubric scores).
+      // Asserted on the key set, not on a substring: `location_page_links` is
+      // a legitimate Tier A count whose name contains the other one.
+      expect(Object.keys(signals)).not.toContain('page_links');
+      expect(signals.location_page_links).toBeTypeOf('number');
+      const everyKey = (value: unknown): string[] =>
+        value !== null && typeof value === 'object'
+          ? Object.entries(value).flatMap(([key, child]) => [key, ...everyKey(child)])
+          : [];
+      expect(everyKey(row.payload)).not.toContain('page_links');
+
       const calls = await app.query<{
         purpose: string;
         isolation: string;

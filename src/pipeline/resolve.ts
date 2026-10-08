@@ -57,24 +57,23 @@ export type PageKind = (typeof PAGE_KINDS)[number];
 export const MAX_PLANNED_PAGES = 6;
 
 /**
- * The candidate path per page kind.
+ * The **fallback** path per page kind, used when the harvest found nothing.
  *
- * **This table is data, and it is a first pass.** §10 freezes the six page
- * *kinds*; it does not say what a firm calls them, and nothing in the repo
- * knows either — no page URL has ever been harvested from a stored snapshot
- * (src/fetch/signals.ts counts location links, it does not collect them). So
- * the plan asks for one conventional path per kind and accepts that some will
- * 404. That is bounded and cheap by Day 3's own correction: a 4xx is terminal,
- * writes a text-free diagnostic row, is never evidence, and is never retried.
+ * This table was the whole plan until the homepage link harvester arrived. It
+ * is now the second choice: `selectFollowUpPages` prefers a URL the firm's own
+ * homepage actually links to, and falls back to one of these conventional
+ * guesses only for a kind the harvest could not fill. A guess that 404s is
+ * bounded and cheap by Day 3's correction — terminal, text-free, never
+ * evidence, never retried — but a real link is better than a bounded miss.
  *
- * The first real run's 404 rate per kind is the evidence that should change
- * these strings, and changing them is a one-line data edit.
+ * The first real run's 404 rate per kind is still the evidence that should
+ * change these strings, and changing them is a one-line data edit.
  *
  * `practice_areas` rather than `services` because §9 and §10 use "practice
  * areas" throughout as the thing to extract and to score — "practice areas that
  * carry real case value" in the rubric, `practice_area_priors` as a table. The
  * spec's own vocabulary for this vertical is the only evidence available, and
- * both spellings are permitted by src/ai/sanitise.ts's path allowlist anyway.
+ * both spellings are permitted by the §8 path allowlist anyway.
  */
 export const PAGE_PATHS: Readonly<Record<PageKind, string>> = {
   home: '/',
@@ -84,11 +83,6 @@ export const PAGE_PATHS: Readonly<Record<PageKind, string>> = {
   team: '/team',
   location: '/locations',
 };
-
-export interface PlannedPage {
-  readonly kind: PageKind;
-  readonly url: string;
-}
 
 /** Why a candidate was rejected before anything was fetched. */
 export type ResolveRejection =
@@ -152,26 +146,136 @@ export function normaliseCandidateDomain(candidate: string): Normalisation {
 }
 
 /**
- * The §10 stage 3 plan: at most six pages, home first, on the firm's own domain.
+ * Which page kind a path is, or null for a path that is none of them.
+ *
+ * Deliberately separate from the §8 path allowlist, which answers a different
+ * question: the allowlist says "this path is safe to ask for", this says "and
+ * it is the firm's contact page". A path can pass the allowlist and classify as
+ * nothing — `/expertise/criminal` is safe and is not one of §10's six kinds —
+ * in which case it is simply not a candidate.
+ *
+ * Ordered, and the order is the answer: the first pattern that matches wins, so
+ * `/our-team` is `team` rather than `about`. Every pattern is anchored at the
+ * first path segment, because that is the segment a firm names its sections
+ * with, and a deeper segment is a page *within* a section.
+ */
+const PAGE_KIND_PATTERNS: readonly (readonly [PageKind, RegExp])[] = [
+  ['team', /^(?:our-(?:team|people)|team|people|lawyers|our-lawyers|staff)$/],
+  ['contact', /^contact(?:-us)?$/],
+  ['location', /^(?:locations?|offices?|our-offices?|find-us)$/],
+  [
+    'practice_areas',
+    /^(?:practice(?:-areas?)?|areas?-of-(?:law|practice)|services|expertise)$/,
+  ],
+  ['about', /^(?:about(?:-us)?|our-firm|who-we-are|firm)$/],
+];
+
+export function classifyPageKind(pathname: string): PageKind | null {
+  const segments = pathname.split('/').filter((part) => part !== '');
+  if (segments.length === 0) {
+    return 'home';
+  }
+  const first = (segments[0] ?? '').toLowerCase();
+  for (const [kind, pattern] of PAGE_KIND_PATTERNS) {
+    if (pattern.test(first)) {
+      return kind;
+    }
+  }
+  return null;
+}
+
+/** Where a selected URL came from, so the fan-out is auditable (requirement 9). */
+export type PageSource = 'root' | 'discovered' | 'fallback';
+
+export interface SelectedPage {
+  readonly kind: PageKind;
+  readonly url: string;
+  readonly source: PageSource;
+}
+
+/** A candidate the harvester classified, already filtered and first-party. */
+export interface DiscoveredLink {
+  readonly kind: PageKind;
+  readonly url: string;
+}
+
+/** The five kinds that are not the homepage, in §10's order. */
+export const FOLLOW_UP_KINDS: readonly PageKind[] = PAGE_KINDS.filter(
+  (kind) => kind !== 'home',
+);
+
+/**
+ * The homepage, which needs no discovery.
  *
  * https only. The fetcher's frozen policy decides what it will actually open,
  * and a plan that asked for http would be asking it to start unencrypted on a
  * site that almost certainly redirects anyway.
- *
- * Deterministic: the same canonical domain always produces the same list in the
- * same order, which is what makes the fan-out auditable and the per-URL dedupe
- * keys stable across a re-run.
  */
-export function planPages(canonicalDomain: string): readonly PlannedPage[] {
+export function planHomePage(canonicalDomain: string): SelectedPage | undefined {
+  const normalised = normaliseCandidateDomain(canonicalDomain);
+  if (!normalised.ok) {
+    return undefined;
+  }
+  return { kind: 'home', url: `https://${normalised.canonicalDomain}/`, source: 'root' };
+}
+
+/**
+ * The other five pages: a discovered URL per kind where one exists, a
+ * conventional path where none does.
+ *
+ * Deterministic in both directions. For a given canonical domain and a given
+ * ordered candidate list the output is always the same list in the same order,
+ * which is what makes the fan-out auditable and §7's per-URL dedupe keys stable
+ * across a re-run. First candidate of a kind wins, and the harvest hands them
+ * over in document order, so "the first link the homepage offers" is the rule.
+ *
+ * At most one page per kind, so at most five — which with the homepage is §10's
+ * six. Nothing here can exceed that even if the harvest hands over a thousand
+ * candidates, because the loop is over the kinds, not over the candidates.
+ */
+export function selectFollowUpPages(
+  canonicalDomain: string,
+  discovered: readonly DiscoveredLink[] = [],
+): readonly SelectedPage[] {
   const normalised = normaliseCandidateDomain(canonicalDomain);
   if (!normalised.ok) {
     return [];
   }
 
-  const pages = PAGE_KINDS.map((kind) => ({
-    kind,
-    url: `https://${normalised.canonicalDomain}${PAGE_PATHS[kind]}`,
-  }));
+  const pages: SelectedPage[] = [];
+  for (const kind of FOLLOW_UP_KINDS) {
+    const found = discovered.find((link) => link.kind === kind);
+    pages.push(
+      found === undefined
+        ? {
+            kind,
+            url: `https://${normalised.canonicalDomain}${PAGE_PATHS[kind]}`,
+            source: 'fallback',
+          }
+        : { kind, url: found.url, source: 'discovered' },
+    );
+  }
+  return pages;
+}
+
+/**
+ * The whole six-page plan, as one list.
+ *
+ * Not used to enqueue anything — §10 stage 3 happens in two waves now, because
+ * preferring a discovered URL means the homepage has to be fetched before the
+ * other five can be chosen. This exists so the complete plan can be asserted,
+ * reported and reasoned about in one place, and so that "six, home first"
+ * remains a property of one function rather than of two call sites.
+ */
+export function planPages(
+  canonicalDomain: string,
+  discovered: readonly DiscoveredLink[] = [],
+): readonly SelectedPage[] {
+  const home = planHomePage(canonicalDomain);
+  if (home === undefined) {
+    return [];
+  }
+  const pages = [home, ...selectFollowUpPages(canonicalDomain, discovered)];
 
   // The cap is applied here as well as asserted in a test, because the day
   // someone adds a seventh kind to PAGE_KINDS this is what stops the fetcher

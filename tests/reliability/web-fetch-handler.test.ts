@@ -4,6 +4,8 @@ import type { AddressInfo } from 'node:net';
 import type { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
+import { PAGE_LINKS_VERSION } from '../../src/fetch/links';
+import { SIGNALS_VERSION } from '../../src/fetch/signals';
 import { AUTH_HEADER } from '../../src/fetcher/contract';
 import { createFetcherServer } from '../../src/fetcher/server';
 import { FROZEN_POLICY, type FetchPolicy } from '../../src/fetch/policy';
@@ -162,8 +164,9 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     // only the privileged zone can read it.
     expect(JSON.stringify(result)).not.toContain('page at');
     expect(Object.keys(result).sort()).toStrictEqual([
-      'extractableSnapshotIds', 'extractsEnqueued', 'httpError', 'httpUnavailable',
-      'refused', 'robotsDisallowed', 'stored',
+      'extractableSnapshotIds', 'extractsEnqueued', 'followUpsDiscovered',
+      'followUpsEnqueued', 'httpError', 'httpUnavailable', 'refused',
+      'robotsDisallowed', 'stored',
     ]);
   }, 60_000);
 
@@ -275,6 +278,46 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
         `SELECT count(*) AS hits FROM web_snapshots WHERE text LIKE '%HANDLER_ERROR_MARKER%'`,
       );
       expect(rows[0]?.hits).toBe('0');
+    }, 60_000);
+  });
+
+  describe('the link harvest reaches the database and nothing else', () => {
+    it('is written into web_snapshots.signals by the fetcher, with a version', async () => {
+      // End to end through the real fetcher: the harvest is stamped onto the
+      // snapshot beside the Tier A scan, in the process that read the markup.
+      const job = await claimFetchJob([`${originUrl}/`]);
+      const result = await handleWebFetch(job, deps());
+      expect(result.stored).toBe(1);
+
+      const { rows } = await db.adminPool.query<{
+        links_version: string | null;
+        candidates: unknown;
+        tier_a: string | null;
+      }>(
+        `SELECT signals -> 'page_links' ->> 'links_version' AS links_version,
+                signals -> 'page_links' -> 'candidates'    AS candidates,
+                signals ->> 'signals_version'              AS tier_a
+           FROM web_snapshots WHERE id = $1`,
+        [result.extractableSnapshotIds[0]],
+      );
+      expect(rows[0]?.links_version).toBe(PAGE_LINKS_VERSION);
+      // The Tier A scan is untouched: one column, two independent reads.
+      expect(rows[0]?.tier_a).toBe(SIGNALS_VERSION);
+
+      // This origin is a loopback IP, which has no registrable domain, so
+      // nothing on it can be first party to anything. An honest empty harvest,
+      // not an error — and the proof that the filter runs inside the fetcher.
+      expect(rows[0]?.candidates).toStrictEqual([]);
+    }, 60_000);
+
+    it('never returns markup or a link list across the fetch boundary', async () => {
+      const job = await claimFetchJob([`${originUrl}/`]);
+      const result = await handleWebFetch(job, deps());
+      const serialised = JSON.stringify(result);
+      expect(serialised).not.toContain('page at');
+      expect(serialised).not.toContain('href');
+      expect(serialised).not.toContain('page_links');
+      expect(serialised).not.toContain('candidates');
     }, 60_000);
   });
 

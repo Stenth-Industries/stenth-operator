@@ -10,11 +10,14 @@ import { describe, expect, it } from 'vitest';
 
 import { ALLOWED_PATH } from '../../src/ai/sanitise';
 import {
+  FOLLOW_UP_KINDS,
   MAX_PLANNED_PAGES,
   PAGE_KINDS,
   PAGE_PATHS,
   normaliseCandidateDomain,
+  planHomePage,
   planPages,
+  selectFollowUpPages,
 } from '../../src/pipeline/resolve';
 import { MAX_PAGES_PER_JOB } from '../../src/worker/handlers/web-fetch';
 
@@ -123,7 +126,11 @@ describe('§10 stage 3: the page plan', () => {
   it('plans at most six pages, home first, all on the firm’s own domain', () => {
     const pages = planPages('firm.com.au');
     expect(pages).toHaveLength(6);
-    expect(pages[0]).toStrictEqual({ kind: 'home', url: 'https://firm.com.au/' });
+    expect(pages[0]).toStrictEqual({
+      kind: 'home',
+      url: 'https://firm.com.au/',
+      source: 'root',
+    });
     expect(pages.map((page) => page.kind)).toStrictEqual([...PAGE_KINDS]);
     for (const page of pages) {
       expect(new URL(page.url).hostname).toBe('firm.com.au');
@@ -141,6 +148,59 @@ describe('§10 stage 3: the page plan', () => {
     expect(planPages('203.0.113.10')).toStrictEqual([]);
     expect(planPages('com.au')).toStrictEqual([]);
     expect(planPages('')).toStrictEqual([]);
+  });
+
+  it('prefers a discovered URL and falls back per kind, never mixing them up', () => {
+    const pages = selectFollowUpPages('firm.com.au', [
+      { kind: 'contact', url: 'https://firm.com.au/contact-us' },
+      { kind: 'team', url: 'https://www.firm.com.au/our-people' },
+    ]);
+    expect(pages).toStrictEqual([
+      { kind: 'about', url: 'https://firm.com.au/about', source: 'fallback' },
+      { kind: 'practice_areas', url: 'https://firm.com.au/practice-areas', source: 'fallback' },
+      { kind: 'contact', url: 'https://firm.com.au/contact-us', source: 'discovered' },
+      { kind: 'team', url: 'https://www.firm.com.au/our-people', source: 'discovered' },
+      { kind: 'location', url: 'https://firm.com.au/locations', source: 'fallback' },
+    ]);
+  });
+
+  it('emits exactly five follow-ups whatever the harvest contains', () => {
+    // The loop is over the page kinds, not over the candidates, so a harvest of
+    // a thousand cannot widen the plan past §10's six.
+    const flood = Array.from({ length: 1_000 }, (_u, index) => ({
+      kind: 'location' as const,
+      url: `https://firm.com.au/locations/branch-${index}`,
+    }));
+    const pages = selectFollowUpPages('firm.com.au', flood);
+    expect(pages).toHaveLength(5);
+    expect(pages.filter((page) => page.source === 'discovered')).toHaveLength(1);
+    expect(planPages('firm.com.au', flood)).toHaveLength(MAX_PLANNED_PAGES);
+  });
+
+  it('takes the first candidate of a kind, deterministically', () => {
+    const discovered = [
+      { kind: 'about' as const, url: 'https://firm.com.au/about-us' },
+      { kind: 'about' as const, url: 'https://firm.com.au/our-firm' },
+    ];
+    expect(selectFollowUpPages('firm.com.au', discovered)[0]).toStrictEqual({
+      kind: 'about',
+      url: 'https://firm.com.au/about-us',
+      source: 'discovered',
+    });
+    expect(selectFollowUpPages('firm.com.au', discovered)).toStrictEqual(
+      selectFollowUpPages('firm.com.au', discovered),
+    );
+  });
+
+  it('plans nothing at all for a domain that does not normalise', () => {
+    expect(selectFollowUpPages('203.0.113.10', [])).toStrictEqual([]);
+    expect(planHomePage('com.au')).toBeUndefined();
+  });
+
+  it('never plans a home follow-up: the homepage is wave one', () => {
+    expect(FOLLOW_UP_KINDS).toStrictEqual(['about', 'practice_areas', 'contact', 'team', 'location']);
+    expect(FOLLOW_UP_KINDS).not.toContain('home');
+    expect(FOLLOW_UP_KINDS).toHaveLength(MAX_PLANNED_PAGES - 1);
   });
 
   it('plans only paths the next_urls allowlist would also accept', () => {

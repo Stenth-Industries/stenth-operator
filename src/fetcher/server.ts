@@ -24,6 +24,7 @@ import { htmlToText, plainToText } from '../fetch/html-to-text';
 import { HostPoliteness } from '../fetch/politeness';
 import { FROZEN_POLICY, type FetchPolicy } from '../fetch/policy';
 import { decide, parseRobots, RobotsCache } from '../fetch/robots';
+import { harvestPageLinks, type PageLinkHarvest } from '../fetch/links';
 import { scanTierASignals, type TierASignals } from '../fetch/signals';
 import { getLogger, withTrace } from '../obs/log';
 import { adoptTraceId } from '../obs/trace';
@@ -331,7 +332,21 @@ export async function fetchAndStore(
   // the evidence exists. No model, no network, no credential: regular
   // expressions over markup, producing booleans, counts and identifiers.
   const signals =
-    outcome.contentType === 'text/plain' ? undefined : scanTierASignals(outcome.body);
+    outcome.contentType === 'text/plain'
+      ? undefined
+      : {
+          ...scanTierASignals(outcome.body),
+          // The link harvest, read from the same markup in the same breath and
+          // for the same reason: htmlToText is next and it drops every <a>.
+          //
+          // Run for every HTML page, not only the homepage, because the fetch
+          // request stays frozen at company_id, url and trace_id — "everything
+          // a job payload could otherwise reach stays in the fetcher's own
+          // policy". A page kind is a job's business, not the fetcher's. Only
+          // the home job's handler reads this back, and it re-validates every
+          // candidate before any of them becomes a job.
+          page_links: harvestPageLinks(outcome.body, outcome.finalUrl),
+        };
 
   // --- untrusted content becomes text, then a row ---
   const extracted =
@@ -438,8 +453,17 @@ async function storeSnapshot(
     bytes: number | undefined;
     robotsAllowed: boolean;
     traceId: string;
-    /** The Tier A scan, for a 2xx HTML page. Absent means no scan happened. */
-    signals?: TierASignals | undefined;
+    /**
+     * The deterministic reads of the markup, for a 2xx HTML page: §9's Tier A
+     * scan and §10 stage 3's link harvest. Absent means no scan happened.
+     *
+     * One column because they are one fact about one page — "what code could
+     * see in this markup before it was thrown away" — and because adding a
+     * second jsonb column for the second deterministic read would be a
+     * migration for no gain. Readers pick named keys, so a reader that wants
+     * only Tier A is unaffected by the new one.
+     */
+    signals?: (TierASignals & { readonly page_links: PageLinkHarvest }) | undefined;
   },
 ): Promise<string | undefined> {
   const inserted = await pool.query<{ id: string }>(

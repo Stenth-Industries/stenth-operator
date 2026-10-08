@@ -14,13 +14,12 @@ import type { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { enqueue } from '../../src/jobs/enqueue';
-import { dedupeKey, fetchUrlHash } from '../../src/jobs/kinds';
+import { dedupeKey, fetchUrlHash, todayUtc } from '../../src/jobs/kinds';
 import { claimJob, type ClaimedJob } from '../../src/jobs/queue';
-import { PAGE_KINDS, planPages } from '../../src/pipeline/resolve';
+import { planHomePage } from '../../src/pipeline/resolve';
 import {
   companyResolvePayloadSchema,
   handleCompanyResolve,
-  todayUtc,
 } from '../../src/worker/handlers/company-resolve';
 import { createTestDatabase, hasDatabase, type TestDatabase } from '../helpers/testDb';
 
@@ -99,22 +98,25 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
 
   // -------------------------------------------------------------- the happy path
   describe('a fresh candidate', () => {
-    it('creates the company, the provenance row, the prospect and six fetch jobs', async () => {
+    it('creates the company, the provenance row, the prospect and the homepage job', async () => {
       const job = await claimResolveJob('https://www.paterson-finch.com.au/');
       const result = await handleCompanyResolve(job, { pool: app });
 
+      // One page in this wave. §10 stage 3's other five are chosen by the
+      // homepage's own job from the links the harvester read, which is why this
+      // stage cannot know them yet.
       expect(result).toMatchObject({
         kind: 'resolved',
         canonicalDomain: 'paterson-finch.com.au',
         companyCreated: true,
         prospectCreated: true,
-        pagesPlanned: 6,
-        fetchesEnqueued: 6,
+        pagesPlanned: 1,
+        fetchesEnqueued: 1,
       });
       if (result.kind !== 'resolved') {
         throw new Error('expected a resolution');
       }
-      expect(result.pageKinds).toStrictEqual([...PAGE_KINDS]);
+      expect(result.pageKinds).toStrictEqual(['home']);
 
       // §4: canonical_domain is the registrable domain, lowercased, no www.
       const company = await app.query<{ canonical_domain: string }>(
@@ -140,9 +142,9 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       expect(prospect.rows[0]?.company_id).toBe(result.companyId);
     });
 
-    it('fans out one job per page, never one job carrying six URLs', async () => {
-      // This is the whole answer to Day 3's per-URL retry residual: a page's
-      // retry budget is its own, because the page is its own job.
+    it('enqueues one job carrying one URL, never a job carrying a list', async () => {
+      // Day 3's per-URL retry residual, closed: a page's retry budget is its
+      // own, because the page is its own job. That holds in both waves.
       const job = await claimResolveJob('firm-one.com.au');
       const result = await handleCompanyResolve(job, { pool: app });
       if (result.kind !== 'resolved') {
@@ -150,20 +152,28 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       }
 
       const jobs = await fetchJobs();
-      expect(jobs).toHaveLength(6);
-      for (const row of jobs) {
-        expect((row.payload as { urls: string[] }).urls).toHaveLength(1);
-        expect(row.parent_job_id).toBe(job.id);
-      }
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.parent_job_id).toBe(job.id);
+      expect(jobs[0]?.payload).toMatchObject({
+        company_id: result.companyId,
+        urls: ['https://firm-one.com.au/'],
+        page_kind: 'home',
+        // Provenance: the root is neither discovered nor a guess.
+        page_source: 'root',
+        occurrence: result.occurrence,
+      });
+      expect((jobs[0]?.payload as { urls: string[] }).urls).toHaveLength(1);
+    });
 
-      // Every planned URL is present exactly once, and each carries its page
-      // kind so the 404 rate per kind is measurable later.
-      const planned = planPages('firm-one.com.au');
-      const urls = jobs.map((row) => (row.payload as { urls: string[] }).urls[0]).sort();
-      expect(urls).toStrictEqual([...planned.map((page) => page.url)].sort());
-      expect(new Set(jobs.map((row) => (row.payload as { page_kind: string }).page_kind))).toStrictEqual(
-        new Set(PAGE_KINDS),
-      );
+    it('carries the occurrence so all six pages share one (§7)', async () => {
+      const job = await claimResolveJob('firm-occurrence.com.au');
+      const result = await handleCompanyResolve(job, { pool: app, occurrence: '2026-10-08' });
+      if (result.kind !== 'resolved') {
+        throw new Error('expected a resolution');
+      }
+      expect(result.occurrence).toBe('2026-10-08');
+      const jobs = await fetchJobs();
+      expect((jobs[0]?.payload as { occurrence: string }).occurrence).toBe('2026-10-08');
     });
 
     it('uses §7’s per-URL key, so the keys are distinct and reproducible', async () => {
@@ -174,11 +184,10 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       }
 
       const jobs = await fetchJobs();
-      const expected = planPages('firm-two.com.au')
-        .map((page) => dedupeKey.webFetch(result.companyId, fetchUrlHash([page.url]), '2026-10-08'))
-        .sort();
-      expect(jobs.map((row) => row.dedupe_key)).toStrictEqual(expected);
-      expect(new Set(jobs.map((row) => row.dedupe_key)).size).toBe(6);
+      const home = planHomePage('firm-two.com.au');
+      expect(jobs.map((row) => row.dedupe_key)).toStrictEqual([
+        dedupeKey.webFetch(result.companyId, fetchUrlHash([home?.url as string]), '2026-10-08'),
+      ]);
     });
 
     it('writes one company.resolved event with counts and no prose', async () => {
@@ -209,8 +218,11 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
         canonical_domain: 'firm-three.com.au',
         company_created: true,
         prospect_created: true,
-        pages_planned: 6,
-        fetches_enqueued: 6,
+        pages_planned: 1,
+        fetches_enqueued: 1,
+        // The five the homepage will choose, named here so the audit shows the
+        // ceiling this fan-out is working towards.
+        follow_up_kinds: ['about', 'practice_areas', 'contact', 'team', 'location'],
       });
       // §16: the spine carries ids, counts and machine tokens. source_ref is a
       // search query, which is prose, and it stays in company_sources.
@@ -236,9 +248,9 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       );
       expect(companies.rows[0]?.count).toBe('1');
 
-      // One company, one prospect, and six fetch jobs — not twenty-four.
+      // One company, one prospect, one homepage fetch — not four of each.
       const jobs = await fetchJobs();
-      expect(jobs).toHaveLength(6);
+      expect(jobs).toHaveLength(1);
       const prospects = await app.query<{ count: string }>(
         'SELECT count(*)::text AS count FROM prospects',
       );
@@ -255,7 +267,7 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
 
       // The rejection is the §10 stage 2 decision, so it enqueues nothing new
       // and the company row is untouched.
-      expect(await fetchJobs()).toHaveLength(6);
+      expect(await fetchJobs()).toHaveLength(1);
       const events = await app.query<{ payload: Record<string, unknown> }>(
         `SELECT payload FROM events WHERE kind = 'company.rejected'`,
       );
@@ -270,7 +282,7 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       // The same claimed job run twice, which is what a reaper requeue produces.
       const job = await claimResolveJob('firm-replay.com.au');
       const first = await handleCompanyResolve(job, { pool: app, occurrence: '2026-10-08' });
-      expect(first).toMatchObject({ kind: 'resolved', fetchesEnqueued: 6 });
+      expect(first).toMatchObject({ kind: 'resolved', fetchesEnqueued: 1 });
 
       const again = await handleCompanyResolve(job, { pool: app, occurrence: '2026-10-08' });
       // The prospect now exists, so stage 2 answers before the fan-out — and
@@ -278,34 +290,33 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
       // the same work.
       expect(again).toMatchObject({ kind: 'rejected', reason: 'already_a_prospect' });
 
-      expect(await fetchJobs()).toHaveLength(6);
+      expect(await fetchJobs()).toHaveLength(1);
       const sources = await app.query<{ count: string }>(
         'SELECT count(*)::text AS count FROM company_sources',
       );
       expect(sources.rows[0]?.count).toBe('1');
     });
 
-    it('re-enqueues nothing twice when only the fan-out is replayed', async () => {
-      // Same company, same occurrence, prospect already present: every key
-      // collides and `inserted` is false for all six.
+    it('re-enqueues nothing twice when the same page is replayed', async () => {
+      // Same company, same page, same occurrence: the key collides and
+      // `inserted` is false, which is what makes a replay a no-op.
       const job = await claimResolveJob('firm-keys.com.au');
       const result = await handleCompanyResolve(job, { pool: app, occurrence: '2026-10-08' });
       if (result.kind !== 'resolved') {
         throw new Error('expected a resolution');
       }
-      let reinserted = 0;
-      for (const page of planPages('firm-keys.com.au')) {
-        const { inserted } = await enqueue(app, {
-          kind: 'web.fetch',
-          dedupeKey: dedupeKey.webFetch(result.companyId, fetchUrlHash([page.url]), '2026-10-08'),
-          traceId: TRACE,
-          payload: { company_id: result.companyId, urls: [page.url] },
-        });
-        if (inserted) {
-          reinserted += 1;
-        }
-      }
-      expect(reinserted).toBe(0);
+      const home = planHomePage('firm-keys.com.au');
+      const { inserted } = await enqueue(app, {
+        kind: 'web.fetch',
+        dedupeKey: dedupeKey.webFetch(
+          result.companyId,
+          fetchUrlHash([home?.url as string]),
+          '2026-10-08',
+        ),
+        traceId: TRACE,
+        payload: { company_id: result.companyId, urls: [home?.url as string] },
+      });
+      expect(inserted).toBe(false);
     });
   });
 
@@ -413,27 +424,23 @@ describeWithDb('the company.resolve handler (§6, §7, §10 stages 1-3)', () => 
         kind: 'resolved',
         companyCreated: true,
         prospectCreated: true,
-        fetchesEnqueued: 6,
+        fetchesEnqueued: 1,
       });
     });
   });
 
   // ------------------------------------------------------------ the queue itself
   describe('through the real queue (§6)', () => {
-    it('leaves six claimable web.fetch jobs, each with its own attempt budget', async () => {
+    it('leaves one claimable homepage job with its own attempt budget', async () => {
       const job = await claimResolveJob('firm-queue.com.au');
       await handleCompanyResolve(job, { pool: app });
 
-      const claimed: string[] = [];
-      for (let index = 0; index < 6; index += 1) {
-        const next = await claimJob(app, `w${index}`);
-        expect(next?.kind).toBe('web.fetch');
-        expect(next?.attempts).toBe(1);
-        expect(next?.max_attempts).toBe(3);
-        claimed.push((next?.payload as { urls: string[] }).urls[0] as string);
-      }
-      // Six distinct pages, and nothing left.
-      expect(new Set(claimed).size).toBe(6);
+      const next = await claimJob(app, 'w0');
+      expect(next?.kind).toBe('web.fetch');
+      expect(next?.attempts).toBe(1);
+      expect(next?.max_attempts).toBe(3);
+      expect((next?.payload as { page_kind: string }).page_kind).toBe('home');
+      // And nothing else: the second wave needs the homepage read first.
       expect(await claimJob(app, 'w-last')).toBeUndefined();
     });
   });

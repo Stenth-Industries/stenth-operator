@@ -22,11 +22,19 @@ import {
 } from '../../fetcher/contract';
 import { EXTRACTION_SCHEMA_VERSION } from '../../ai/schemas/extraction-v1';
 import { enqueue } from '../../jobs/enqueue';
-import { dedupeKey } from '../../jobs/kinds';
+import { dedupeKey, fetchUrlHash, todayUtc } from '../../jobs/kinds';
 import type { ClaimedJob } from '../../jobs/queue';
 import { withTrace } from '../../obs/log';
 import { TRACE_HEADER } from '../../obs/trace';
-import { PAGE_KINDS } from '../../pipeline/resolve';
+import { safeFirstPartyUrl } from '../../pipeline/links';
+import {
+  classifyPageKind,
+  FOLLOW_UP_KINDS,
+  PAGE_KINDS,
+  selectFollowUpPages,
+  type DiscoveredLink,
+  type PageKind,
+} from '../../pipeline/resolve';
 
 /** §10 stage 3: "max 6 pages: home, about, services or practice areas, contact, team, one location page". */
 export const MAX_PAGES_PER_JOB = 6;
@@ -44,12 +52,23 @@ export const webFetchPayloadSchema = z
      * decides the candidate paths in src/pipeline/resolve.ts.
      */
     page_kind: z.enum(PAGE_KINDS).optional(),
+    /**
+     * §7's `yyyy-mm-dd` occurrence, carried so that all six pages of one firm
+     * share one. Without it the homepage's fan-out would stamp its own date,
+     * and a home job claimed after midnight would put its five siblings in a
+     * different occurrence from itself.
+     */
+    occurrence: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    /** Whether this URL came from the harvest or from a conventional path. */
+    page_source: z.enum(['root', 'discovered', 'fallback']).optional(),
   })
   .strict();
 
 export interface WebFetchDeps {
   readonly fetcherUrl: string;
   readonly sharedSecret: string;
+  /** The §7 occurrence for the fan-out, when the payload does not carry one. */
+  readonly occurrence?: string;
   /**
    * The application pool, for the §6 enqueue of web.extract per snapshot.
    *
@@ -91,6 +110,16 @@ export interface WebFetchResult {
    * key is permanent and the second enqueue is a no-op rather than a duplicate.
    */
   readonly extractsEnqueued: number;
+  /**
+   * The follow-up web.fetch jobs this call enqueued (§10 stage 3's second wave).
+   *
+   * Non-zero only for the homepage job: it is the one job that can see what the
+   * firm's own homepage links to. A discovered page never fans out again, which
+   * is what keeps the depth at one and the total at six.
+   */
+  readonly followUpsEnqueued: number;
+  /** How many of those came from the harvest rather than a conventional path. */
+  readonly followUpsDiscovered: number;
 }
 
 /**
@@ -211,6 +240,14 @@ export async function handleWebFetch(
     }
   }
 
+  // §10 stage 3's second wave. Only the homepage job runs it: it is the only
+  // job that has seen what the firm's own homepage links to, and a discovered
+  // page fanning out again would make the six-page ceiling unenforceable.
+  const followUps =
+    payload.page_kind === 'home' && extractableSnapshotIds.length > 0
+      ? await fanOutFromHomepage(job, payload, extractableSnapshotIds[0] as string, deps)
+      : { enqueued: 0, discovered: 0 };
+
   log.info(
     {
       company_id: payload.company_id,
@@ -221,6 +258,8 @@ export async function handleWebFetch(
       http_unavailable: httpUnavailable,
       refused,
       extracts_enqueued: extractsEnqueued,
+      follow_ups_enqueued: followUps.enqueued,
+      follow_ups_discovered: followUps.discovered,
     },
     'web.fetch complete',
   );
@@ -247,5 +286,150 @@ export async function handleWebFetch(
     refused,
     extractableSnapshotIds,
     extractsEnqueued,
+    followUpsEnqueued: followUps.enqueued,
+    followUpsDiscovered: followUps.discovered,
   };
+}
+
+/**
+ * Chooses and enqueues the five pages that follow the homepage.
+ *
+ * ## The trust step, which is the point of this function
+ *
+ * The candidate list was produced by the fetcher — the process whose job is
+ * handling hostile input — from attacker-controlled markup. The worker already
+ * refuses to believe that process's HTTP reply without parsing it; believing
+ * its stored output would be the same mistake with a database in between. So
+ * every candidate is run through `safeFirstPartyUrl` again here, and against
+ * `companies.canonical_domain` this time rather than the page's own final URL:
+ * a redirect could have moved the snapshot, and §4 makes the canonical domain
+ * the firm's identity. The page kind is re-derived too, so a mislabelled
+ * candidate is reclassified rather than trusted.
+ *
+ * In other words the fetcher's filter is a courtesy that keeps junk out of the
+ * database. This is the one that decides what gets fetched.
+ */
+async function fanOutFromHomepage(
+  job: ClaimedJob,
+  payload: z.infer<typeof webFetchPayloadSchema>,
+  snapshotId: string,
+  deps: WebFetchDeps,
+): Promise<{ enqueued: number; discovered: number }> {
+  const log = withTrace(job.trace_id);
+  const occurrence = payload.occurrence ?? deps.occurrence ?? todayUtc();
+
+  const { rows } = await deps.pool.query<{
+    canonical_domain: string;
+    page_links: unknown;
+  }>(
+    `SELECT c.canonical_domain::text AS canonical_domain, s.signals -> 'page_links' AS page_links
+       FROM web_snapshots s
+       JOIN companies c ON c.id = s.company_id
+      WHERE s.id = $1`,
+    [snapshotId],
+  );
+  const row = rows[0];
+  if (row === undefined) {
+    throw new Error(`web_snapshots ${snapshotId} vanished between storing and reading it back`);
+  }
+
+  const discovered = revalidateCandidates(row.page_links, row.canonical_domain);
+  const pages = selectFollowUpPages(row.canonical_domain, discovered);
+
+  let enqueued = 0;
+  for (const page of pages) {
+    const { inserted } = await enqueue(deps.pool, {
+      kind: 'web.fetch',
+      dedupeKey: dedupeKey.webFetch(payload.company_id, fetchUrlHash([page.url]), occurrence),
+      traceId: job.trace_id,
+      payload: {
+        company_id: payload.company_id,
+        urls: [page.url],
+        page_kind: page.kind,
+        page_source: page.source,
+        occurrence,
+      },
+      parentJobId: job.id,
+    });
+    if (inserted) {
+      enqueued += 1;
+    }
+  }
+
+  log.info(
+    {
+      company_id: payload.company_id,
+      canonical_domain: row.canonical_domain,
+      harvest_candidates: discovered.length,
+      follow_ups_enqueued: enqueued,
+      discovered_pages: pages.filter((page) => page.source === 'discovered').length,
+    },
+    'the homepage chose the remaining pages',
+  );
+
+  return {
+    enqueued,
+    discovered: pages.filter((page) => page.source === 'discovered').length,
+  };
+}
+
+/**
+ * Re-derives the harvest in the privileged zone, trusting none of it.
+ *
+ * The stored value is jsonb written by the fetcher, so its *shape* is checked
+ * before its contents: anything that is not an object with a candidate array is
+ * simply no harvest, which falls back to the conventional paths rather than
+ * failing the job. Within it, each entry must be a string URL that passes every
+ * §8 rule against the firm's canonical domain, and its kind is computed here
+ * rather than read.
+ *
+ * Capped at the five follow-up kinds by construction: one URL per kind, first
+ * valid entry wins, so a stored list of a thousand yields at most five.
+ */
+function revalidateCandidates(stored: unknown, canonicalDomain: string): DiscoveredLink[] {
+  if (stored === null || typeof stored !== 'object' || Array.isArray(stored)) {
+    return [];
+  }
+  const raw = (stored as { candidates?: unknown }).candidates;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  let base: URL;
+  try {
+    base = new URL(`https://${canonicalDomain}/`);
+  } catch {
+    return [];
+  }
+
+  const byKind = new Map<PageKind, string>();
+  for (const entry of raw) {
+    if (byKind.size >= FOLLOW_UP_KINDS.length) {
+      break;
+    }
+    const candidate =
+      entry !== null && typeof entry === 'object'
+        ? (entry as { url?: unknown }).url
+        : undefined;
+    if (typeof candidate !== 'string' || candidate === '') {
+      continue;
+    }
+
+    const verdict = safeFirstPartyUrl(candidate, base, canonicalDomain);
+    if (!verdict.ok) {
+      continue;
+    }
+
+    // Computed, not read: the stored `kind` is the fetcher's opinion.
+    const kind = classifyPageKind(new URL(verdict.url).pathname);
+    if (kind === null || kind === 'home' || byKind.has(kind)) {
+      continue;
+    }
+    byKind.set(kind, verdict.url);
+  }
+
+  return FOLLOW_UP_KINDS.flatMap((kind) => {
+    const url = byKind.get(kind);
+    return url === undefined ? [] : [{ kind, url }];
+  });
 }

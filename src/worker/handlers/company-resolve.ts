@@ -6,6 +6,26 @@
  * involved at any point — this handler never calls a provider, never reserves
  * budget, and never reads a page.
  *
+ * ## Two waves, because a discovered URL beats a guessed one
+ *
+ * §10 stage 3 wants six pages: home, about, services or practice areas,
+ * contact, team, one location page. It does not say what a firm calls them, and
+ * the firm's own homepage does. So this stage enqueues the homepage, and the
+ * homepage's own job chooses the other five from the links the harvester read
+ * out of its markup — falling back to a conventional path for any kind the
+ * homepage did not offer.
+ *
+ * That makes the fan-out two calls rather than one, and the invariant it has to
+ * preserve is per-page jobs and a hard ceiling of six: one here, at most five
+ * there, each its own job with its own §7 key and its own §6 retry budget.
+ * `selectFollowUpPages` enforces the five by looping over the page kinds rather
+ * than over the candidates, so a harvest of a thousand links cannot widen it.
+ *
+ * The alternative — resolve fetching the homepage itself and then enqueueing
+ * all six — would put a 60-second network call inside this transaction and give
+ * the worker a second way to reach the fetcher. §6's chain is
+ * company.resolve → web.fetch → web.extract, and this keeps it.
+ *
  * ## One web.fetch job per page, not one job carrying six URLs
  *
  * This is the design decision Day 3 deferred, and §7 already contains the
@@ -40,13 +60,14 @@ import type { Pool } from 'pg';
 import { z } from 'zod';
 
 import { enqueue } from '../../jobs/enqueue';
-import { dedupeKey, fetchUrlHash } from '../../jobs/kinds';
+import { dedupeKey, fetchUrlHash, todayUtc } from '../../jobs/kinds';
 import type { ClaimedJob } from '../../jobs/queue';
 import { withTrace } from '../../obs/log';
 import {
+  FOLLOW_UP_KINDS,
   MAX_PLANNED_PAGES,
   normaliseCandidateDomain,
-  planPages,
+  planHomePage,
   type PageKind,
   type ResolveRejection,
 } from '../../pipeline/resolve';
@@ -81,6 +102,8 @@ export type CompanyResolveResult =
       readonly fetchesEnqueued: number;
       readonly pagesPlanned: number;
       readonly pageKinds: readonly PageKind[];
+      /** The §7 occurrence all six of this firm's pages will share. */
+      readonly occurrence: string;
     }
   | {
       readonly kind: 'rejected';
@@ -88,11 +111,6 @@ export type CompanyResolveResult =
       readonly detail: string;
       readonly companyId: string | null;
     };
-
-/** Today in UTC, as §7's `yyyy-mm-dd` occurrence. */
-export function todayUtc(now: Date = new Date()): string {
-  return now.toISOString().slice(0, 10);
-}
 
 /**
  * Resolves one candidate.
@@ -225,11 +243,18 @@ export async function handleCompanyResolve(
     );
     const prospectCreated = inserted.rows[0] !== undefined;
 
-    // Stage 3's fan-out. One job per page, each with its own §7 key and its own
-    // §6 retry budget.
-    const pages = planPages(canonicalDomain);
-    if (pages.length > MAX_PLANNED_PAGES) {
-      throw new Error(`the page plan produced ${pages.length} pages, over §10's six`);
+    // Stage 3's first wave: the homepage, and only the homepage. The other five
+    // pages are chosen by the homepage's own job, from the links the harvester
+    // read out of its markup — see the note at the top of this file.
+    const home = planHomePage(canonicalDomain);
+    if (home === undefined) {
+      throw new Error(`${canonicalDomain} normalised once and then did not`);
+    }
+    const pages = [home];
+    if (pages.length + FOLLOW_UP_KINDS.length > MAX_PLANNED_PAGES) {
+      throw new Error(
+        `the plan would reach ${pages.length + FOLLOW_UP_KINDS.length} pages, over §10's six`,
+      );
     }
 
     let fetchesEnqueued = 0;
@@ -238,7 +263,13 @@ export async function handleCompanyResolve(
         kind: 'web.fetch',
         dedupeKey: dedupeKey.webFetch(company.id, fetchUrlHash([page.url]), occurrence),
         traceId: job.trace_id,
-        payload: { company_id: company.id, urls: [page.url], page_kind: page.kind },
+        payload: {
+          company_id: company.id,
+          urls: [page.url],
+          page_kind: page.kind,
+          page_source: page.source,
+          occurrence,
+        },
         parentJobId: job.id,
       });
       if (result.inserted) {
@@ -253,6 +284,7 @@ export async function handleCompanyResolve(
       pages_planned: pages.length,
       fetches_enqueued: fetchesEnqueued,
       page_kinds: pages.map((page) => page.kind),
+      follow_up_kinds: [...FOLLOW_UP_KINDS],
       occurrence,
     });
 
@@ -277,6 +309,7 @@ export async function handleCompanyResolve(
       fetchesEnqueued,
       pagesPlanned: pages.length,
       pageKinds: pages.map((page) => page.kind),
+      occurrence,
     };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);

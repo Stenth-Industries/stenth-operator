@@ -14,7 +14,7 @@
  * It rejects rather than repairs wherever the content has no business being
  * there. A silently cleaned field is a field nobody looks at again.
  */
-import { isFirstPartyUrl, registrableDomainOfUrl } from '../pipeline/domain';
+import { filterFirstPartyUrls, MAX_NEXT_URLS } from '../pipeline/links';
 import { isolatedExtractionSchema, type IsolatedExtraction } from './schemas/extraction-v1';
 
 export class SanitiserRejection extends Error {
@@ -86,94 +86,22 @@ function cleanProse(
  * it to the same registrable domain, an allowlist of path patterns, at most
  * five URLs, depth at most two. The model never causes a fetch directly."
  *
- * A URL that fails any rule is dropped silently — unlike a prose field, a bad
- * suggestion here is not evidence of anything, and the whole point is that the
- * list is advice the code is free to ignore.
+ * The rules themselves live in src/pipeline/links.ts, because since Day 5 there
+ * is a second source of untrusted URL suggestions — the deterministic homepage
+ * link harvest — and both must pass the same filter. A rule tightened in one
+ * path and forgotten in the other is the failure a second copy would produce.
+ *
+ * This wrapper is what §8's sentence maps onto: the model's list, capped at
+ * five. It is kept as its own name because `filterNextUrls` is what the
+ * adversarial suite tests and what the injection corpus is about.
  */
-export const ALLOWED_PATH =
-  /^\/(?:|about(?:-us)?|our-(?:team|people|firm|offices?)|team|people|services|practice(?:-areas?)?|areas?-of-(?:law|practice)|expertise|contact(?:-us)?|locations?|offices?)(?:\/[a-z0-9-]*)?\/?$/i;
-
-export const MAX_NEXT_URLS = 5;
-export const MAX_NEXT_URL_DEPTH = 2;
+export { ALLOWED_PATH, MAX_NEXT_URLS, MAX_NEXT_URL_DEPTH } from '../pipeline/links';
 
 export function filterNextUrls(
   candidates: readonly string[] | undefined,
   sourceUrl: string,
 ): string[] {
-  if (candidates === undefined) {
-    return [];
-  }
-
-  let base: URL;
-  try {
-    base = new URL(sourceUrl);
-  } catch {
-    return [];
-  }
-
-  // The firm's own registrable domain, asked of the list rather than assumed.
-  // Null means the source URL has no eTLD+1 at all — an IP, a bare suffix — in
-  // which case there is no "same firm" to be on and the whole list is dropped.
-  const expectedDomain = registrableDomainOfUrl(base.href);
-  if (expectedDomain === null) {
-    return [];
-  }
-
-  const kept: string[] = [];
-  for (const candidate of candidates) {
-    if (kept.length >= MAX_NEXT_URLS) {
-      break;
-    }
-    let target: URL;
-    try {
-      target = new URL(candidate, base);
-    } catch {
-      continue;
-    }
-
-    if (target.protocol !== 'https:' && target.protocol !== 'http:') {
-      continue;
-    }
-
-    // §8's words are "the same registrable domain", and since Day 5 that is
-    // what this asks — the Public Suffix List, through src/pipeline/domain.ts,
-    // the one place in the codebase allowed to answer it.
-    //
-    // This replaces host equality, which was the Day 4 placeholder. The
-    // placeholder was stricter in one way only: it refused `nsw.firm.com.au`
-    // from a page on `firm.com.au`, which §10's own policy says is the same
-    // firm. It was not stricter where it mattered — it could not tell
-    // `firm.com.au` from `firm.com.au.attacker.tld` on principle, only by the
-    // accident of the strings differing, and a homoglyph host is a different
-    // string too, so equality never knew *why* it was right.
-    //
-    // Nothing else relaxes. A different registrable domain is still dropped,
-    // and an IP, a bare suffix or an unparseable host has no registrable
-    // domain and so can never match.
-    if (!isFirstPartyUrl(target.href, expectedDomain).sameFirm) {
-      continue;
-    }
-    if (target.username !== '' || target.password !== '') {
-      continue;
-    }
-    if (target.port !== '' && target.port !== '80' && target.port !== '443') {
-      continue;
-    }
-
-    const segments = target.pathname.split('/').filter((part) => part !== '');
-    if (segments.length > MAX_NEXT_URL_DEPTH) {
-      continue;
-    }
-    if (!ALLOWED_PATH.test(target.pathname)) {
-      continue;
-    }
-
-    const normalised = `${target.origin}${target.pathname}`;
-    if (!kept.includes(normalised)) {
-      kept.push(normalised);
-    }
-  }
-  return kept;
+  return filterFirstPartyUrls(candidates, sourceUrl, MAX_NEXT_URLS);
 }
 
 /**

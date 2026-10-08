@@ -394,3 +394,92 @@ exists. No provider is contacted and no budget is consumed. Those jobs are
 terminal until a human requeues them, which is what `requeueBlockedJob` and
 `ops/day4-extraction/reconcile.ts` are for. Nothing enqueues `company.resolve`
 in production, so none of this starts on its own.
+
+---
+
+# Day 5, the approved link harvester
+
+Approved explicitly on 2026-10-08, after deviation 15 recorded the decision as
+open. This is the capability that closes it.
+
+## 19. The fetcher reads the homepage's links, deterministically
+
+**What was approved.** Deviation 15 said the candidate paths were a first pass
+because "nothing in the repo has ever harvested a page URL from a snapshot", and
+named the alternative: harvest links from the homepage's markup deterministically
+and classify them into §10 stage 3's six kinds. That is now built.
+
+**Where it runs, and why there.** `src/fetch/links.ts`, inside the fetcher, for
+the same reason §19 puts the Tier A scanner there: `htmlToText` is next and it
+drops every `<a>` element, so this is the only moment the links exist. Keeping
+the raw HTML in the database instead would mean storing hostile markup and
+pruning it under §15.
+
+**What crosses the boundary.** At most five URLs, each of which has already
+passed every rule §8 states, written to `web_snapshots.signals` beside the Tier
+A scan. Nothing else. The fetch response schema is `.strict()` and has no link
+field, which a test asserts by trying to add one. No raw markup and no
+unfiltered link set reaches the worker — the handler's own result carries counts
+and snapshot ids, and the chosen URLs exist only as the jobs it enqueued.
+
+**One filter, two callers.** The rules moved to `src/pipeline/links.ts`:
+http/https only, no credentials, ports 80 and 443 only, the same registrable
+domain via the Public Suffix List, the §8 path allowlist, depth at most two,
+deduplication with the query string and fragment dropped, and a cap. There are
+now two sources of untrusted URL suggestions — a model reading a hostile page
+(`next_urls`) and code reading the same page (the harvest) — and a rule
+tightened in one path and forgotten in the other is the failure a second copy
+would eventually produce. `filterNextUrls` is a four-line wrapper over it.
+
+**The worker trusts none of it.** The stored harvest is jsonb written by the
+process whose job is handling hostile input, so the handler re-runs every
+candidate through `safeFirstPartyUrl` — against `companies.canonical_domain`
+this time rather than the page's own final URL, because §4 makes the canonical
+domain the firm's identity and a redirect could have moved the snapshot — and
+re-derives the page kind rather than reading the stored label. The fetcher's
+filter keeps junk out of the database; this is the one that decides what gets
+fetched.
+
+**No model, no provider, no migration, no spend.** A DOM query, a URL filter and
+five anchored regular expressions. `signals` is already jsonb and migration 008
+already grants the fetcher `UPDATE (signals)`, so the second deterministic read
+of the markup shares the column the first one uses — one fact about one page,
+"what code could see in this markup before it was thrown away". Readers pick
+named keys, so `assembleSignals` is unaffected and the harvest never reaches an
+extraction payload or a model, which a case asserts on the payload's key set.
+
+## 20. The fan-out is two waves, and that is a departure from the literal ask
+
+The approved requirement said "company.resolve must still enqueue one web.fetch
+job per selected page". Preferring a discovered URL means the homepage has to be
+*read* before the other five can be selected, so one stage cannot do both: this
+stage enqueues the homepage, and the homepage's own job selects and enqueues the
+rest.
+
+The invariant the requirement protects is kept exactly — one page per job, each
+with its own §7 key and its own §6 retry budget, and a hard ceiling of six: one
+in wave one, at most five in wave two. `selectFollowUpPages` loops over the page
+kinds rather than over the candidates, so a harvest of a thousand links cannot
+widen it, and only a job whose `page_kind` is `home` fans out at all, which
+holds the depth at one. Three cases assert those three properties.
+
+The alternative — `company.resolve` fetching the homepage itself and then
+enqueuing all six — would put a sixty-second network call inside the transaction
+that writes the company, and give the worker a second route to the fetcher. §6's
+chain is company.resolve → web.fetch → web.extract, and adding a job kind to
+avoid that is a specification change to a frozen table.
+
+**A consequence worth stating plainly.** If the homepage cannot be read — a 4xx,
+or a robots `Disallow` on `/` — there is no harvest and no fan-out, so the firm
+gets one request and no further pages. That is deliberate: asking a site five
+more times after it has just refused the homepage is what Day 3's finding argued
+against. Previously `company.resolve` enqueued all six regardless, so a firm
+whose `/` returned 403 but whose `/about` worked would have been read anyway.
+That case is now lost, and the trade is one unwanted request against five.
+
+**`page_source` is the new provenance.** Every web.fetch payload now says
+whether its URL is the `root`, `discovered` from the homepage, or a `fallback`
+guess, and the occurrence is carried so all six pages of one firm share one §7
+date rather than splitting across midnight. Deviation 15's open question — what
+a firm actually calls its about page — is now answerable from the data instead
+of guessed, and the fallback paths remain for the kinds a homepage does not link.
