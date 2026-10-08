@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { dedupeKey, isJobKind, JOB_KINDS, MAX_ATTEMPTS } from '../../src/jobs/kinds';
+import { dedupeKey, fetchUrlHash, isJobKind, JOB_KINDS, MAX_ATTEMPTS } from '../../src/jobs/kinds';
 
 describe('job kinds (SPEC.md §6)', () => {
   it('declares the nine kinds and no retired one', () => {
@@ -76,5 +76,28 @@ describe('dedupe keys (SPEC.md §7)', () => {
     expect(dedupeKey.maintenancePrune('2026-10-07')).not.toBe(
       dedupeKey.maintenancePrune('2026-10-08'),
     );
+  });
+});
+
+describe('the web.fetch url hash (§7)', () => {
+  it('is deterministic, bounded and derived from the work', () => {
+    const url = 'https://firm.com.au/practice-areas';
+    expect(fetchUrlHash([url])).toBe(fetchUrlHash([url]));
+    expect(fetchUrlHash([url])).toHaveLength(16);
+    expect(fetchUrlHash([url])).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('distinguishes different pages, and order within a job', () => {
+    expect(fetchUrlHash(['https://firm.com.au/'])).not.toBe(
+      fetchUrlHash(['https://firm.com.au/about']),
+    );
+    expect(fetchUrlHash(['a', 'b'])).not.toBe(fetchUrlHash(['b', 'a']));
+  });
+
+  it('builds the key §7 specifies', () => {
+    // fetch:{company_id}:{url_hash}:{yyyy-mm-dd} — one key per URL, which is
+    // what gives each page its own retry budget.
+    const key = dedupeKey.webFetch('c0ffee', fetchUrlHash(['https://firm.com.au/']), '2026-10-08');
+    expect(key).toMatch(/^fetch:c0ffee:[0-9a-f]{16}:2026-10-08$/);
   });
 });

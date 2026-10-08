@@ -10,6 +10,7 @@
  * 4, so this stores snapshots and stops there; the enqueue arrives with the
  * handler that can act on it.
  */
+import type { Pool } from 'pg';
 import { z } from 'zod';
 
 import {
@@ -19,9 +20,13 @@ import {
   isRetryable,
   type FetchResponse,
 } from '../../fetcher/contract';
+import { EXTRACTION_SCHEMA_VERSION } from '../../ai/schemas/extraction-v1';
+import { enqueue } from '../../jobs/enqueue';
+import { dedupeKey } from '../../jobs/kinds';
 import type { ClaimedJob } from '../../jobs/queue';
 import { withTrace } from '../../obs/log';
 import { TRACE_HEADER } from '../../obs/trace';
+import { PAGE_KINDS } from '../../pipeline/resolve';
 
 /** §10 stage 3: "max 6 pages: home, about, services or practice areas, contact, team, one location page". */
 export const MAX_PAGES_PER_JOB = 6;
@@ -30,12 +35,31 @@ export const webFetchPayloadSchema = z
   .object({
     company_id: z.string().uuid(),
     urls: z.array(z.string().min(1).max(2_048)).min(1).max(MAX_PAGES_PER_JOB),
+    /**
+     * Which of §10 stage 3's six page kinds this job covers, when a planner set
+     * it. Provenance, not an option: it is never forwarded to the fetcher —
+     * fetchRequestSchema is strict and takes company_id, url and trace_id and
+     * nothing else — and the handler only logs it. company.resolve writes it so
+     * the 404 rate per page kind is measurable, which is the evidence that
+     * decides the candidate paths in src/pipeline/resolve.ts.
+     */
+    page_kind: z.enum(PAGE_KINDS).optional(),
   })
   .strict();
 
 export interface WebFetchDeps {
   readonly fetcherUrl: string;
   readonly sharedSecret: string;
+  /**
+   * The application pool, for the §6 enqueue of web.extract per snapshot.
+   *
+   * Required rather than optional: a handler that silently skips its successor
+   * when a dependency is missing is a pipeline that stops without an error, and
+   * "the enqueue only happens in production" is not a property a test can
+   * verify. Day 3 left this out because web.extract had no handler yet; it has
+   * one now.
+   */
+  readonly pool: Pool;
   /** Injected so the suite can drive the handler without a live service. */
   readonly fetchImpl?: typeof globalThis.fetch;
 }
@@ -61,6 +85,12 @@ export interface WebFetchResult {
    * migration 005.
    */
   readonly extractableSnapshotIds: readonly string[];
+  /**
+   * web.extract jobs this call inserted (§6: "enqueues web.extract per
+   * snapshot"). Lower than the snapshot count on a replay, because §7's extract
+   * key is permanent and the second enqueue is a no-op rather than a duplicate.
+   */
+  readonly extractsEnqueued: number;
 }
 
 /**
@@ -160,14 +190,37 @@ export async function handleWebFetch(
     }
   }
 
+  // §6: "Enqueues next: web.extract per snapshot". Only the extractable ids,
+  // which is only `stored` — a robots row and a 4xx row both exist with text
+  // NULL and neither may become evidence (§8, migration 005).
+  //
+  // Before the retry decision below, deliberately. A page that was stored has
+  // been stored whatever happens to its siblings, and §7's extract key is
+  // permanent, so a retry's second enqueue is a no-op rather than a duplicate.
+  let extractsEnqueued = 0;
+  for (const snapshotId of extractableSnapshotIds) {
+    const { inserted } = await enqueue(deps.pool, {
+      kind: 'web.extract',
+      dedupeKey: dedupeKey.webExtract(snapshotId, EXTRACTION_SCHEMA_VERSION),
+      traceId: job.trace_id,
+      payload: { snapshot_id: snapshotId },
+      parentJobId: job.id,
+    });
+    if (inserted) {
+      extractsEnqueued += 1;
+    }
+  }
+
   log.info(
     {
       company_id: payload.company_id,
+      page_kind: payload.page_kind,
       stored,
       robots_disallowed: robotsDisallowed,
       http_error: httpError,
       http_unavailable: httpUnavailable,
       refused,
+      extracts_enqueued: extractsEnqueued,
     },
     'web.fetch complete',
   );
@@ -186,5 +239,13 @@ export async function handleWebFetch(
     );
   }
 
-  return { stored, robotsDisallowed, httpError, httpUnavailable, refused, extractableSnapshotIds };
+  return {
+    stored,
+    robotsDisallowed,
+    httpError,
+    httpUnavailable,
+    refused,
+    extractableSnapshotIds,
+    extractsEnqueued,
+  };
 }

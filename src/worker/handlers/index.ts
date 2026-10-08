@@ -3,8 +3,8 @@
  *
  * Day 2 builds the engine and registers nothing: every business handler belongs
  * to the day that builds it — web.fetch to Day 3, web.extract to Day 4,
- * company.assess to Day 6, and so on (§25). An empty registry is the honest
- * state, not an oversight.
+ * company.resolve to Day 5, company.assess to Day 6, and so on (§25). An empty
+ * registry is the honest state, not an oversight.
  *
  * A claimed job whose kind has no handler fails through the ordinary path:
  * retried with backoff, then dead with an alert. It is never silently dropped,

@@ -6,6 +6,8 @@
  * a drift shows up as a failing test rather than as a quietly different system.
  */
 
+import { createHash } from 'node:crypto';
+
 /** The nine kinds of §6. gmail.create_draft and maintenance.tick are gone in v1.1. */
 export const JOB_KINDS = [
   'discover.search',
@@ -87,3 +89,19 @@ export const dedupeKey = {
   /** Per-occurrence, written by the scheduler. */
   maintenancePrune: (occurrence: string): string => `prune:${occurrence}`,
 } as const;
+
+/**
+ * The `url_hash` component of §7's web.fetch key.
+ *
+ * §7 writes the key as `fetch:{company_id}:{url_hash}:{yyyy-mm-dd}`, so the
+ * hash has to be bounded, deterministic and derived from the work — never from
+ * a random id. sha256 truncated to 16 hex characters: the key is an identity,
+ * not a security claim, and a URL list of six cannot collide at 64 bits.
+ *
+ * Lives here, beside the key it is part of, because company.resolve's fan-out
+ * and the Day 3 acceptance harness must produce the same key for the same work
+ * or a re-run would duplicate jobs instead of deduplicating them.
+ */
+export function fetchUrlHash(urls: readonly string[]): string {
+  return createHash('sha256').update(urls.join('\n'), 'utf8').digest('hex').slice(0, 16);
+}

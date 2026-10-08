@@ -14,6 +14,7 @@
  * It rejects rather than repairs wherever the content has no business being
  * there. A silently cleaned field is a field nobody looks at again.
  */
+import { isFirstPartyUrl, registrableDomainOfUrl } from '../pipeline/domain';
 import { isolatedExtractionSchema, type IsolatedExtraction } from './schemas/extraction-v1';
 
 export class SanitiserRejection extends Error {
@@ -89,7 +90,7 @@ function cleanProse(
  * suggestion here is not evidence of anything, and the whole point is that the
  * list is advice the code is free to ignore.
  */
-const ALLOWED_PATH =
+export const ALLOWED_PATH =
   /^\/(?:|about(?:-us)?|our-(?:team|people|firm|offices?)|team|people|services|practice(?:-areas?)?|areas?-of-(?:law|practice)|expertise|contact(?:-us)?|locations?|offices?)(?:\/[a-z0-9-]*)?\/?$/i;
 
 export const MAX_NEXT_URLS = 5;
@@ -110,6 +111,14 @@ export function filterNextUrls(
     return [];
   }
 
+  // The firm's own registrable domain, asked of the list rather than assumed.
+  // Null means the source URL has no eTLD+1 at all — an IP, a bare suffix — in
+  // which case there is no "same firm" to be on and the whole list is dropped.
+  const expectedDomain = registrableDomainOfUrl(base.href);
+  if (expectedDomain === null) {
+    return [];
+  }
+
   const kept: string[] = [];
   for (const candidate of candidates) {
     if (kept.length >= MAX_NEXT_URLS) {
@@ -122,14 +131,26 @@ export function filterNextUrls(
       continue;
     }
 
-    // Same host as the page it came from. Not "same registrable domain via the
-    // public suffix list" — that list arrives with company.resolve on Day 5, and
-    // host equality is the stricter of the two, so it is safe to tighten now
-    // and relax later rather than the other way round.
     if (target.protocol !== 'https:' && target.protocol !== 'http:') {
       continue;
     }
-    if (target.hostname !== base.hostname) {
+
+    // §8's words are "the same registrable domain", and since Day 5 that is
+    // what this asks — the Public Suffix List, through src/pipeline/domain.ts,
+    // the one place in the codebase allowed to answer it.
+    //
+    // This replaces host equality, which was the Day 4 placeholder. The
+    // placeholder was stricter in one way only: it refused `nsw.firm.com.au`
+    // from a page on `firm.com.au`, which §10's own policy says is the same
+    // firm. It was not stricter where it mattered — it could not tell
+    // `firm.com.au` from `firm.com.au.attacker.tld` on principle, only by the
+    // accident of the strings differing, and a homoglyph host is a different
+    // string too, so equality never knew *why* it was right.
+    //
+    // Nothing else relaxes. A different registrable domain is still dropped,
+    // and an IP, a bare suffix or an unparseable host has no registrable
+    // domain and so can never match.
+    if (!isFirstPartyUrl(target.href, expectedDomain).sameFirm) {
       continue;
     }
     if (target.username !== '' || target.password !== '') {

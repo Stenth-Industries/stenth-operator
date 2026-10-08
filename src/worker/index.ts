@@ -28,6 +28,7 @@ import { getLogger, withTrace } from '../obs/log';
 import { getHandler, registerHandler } from './handlers';
 import { resolveProvider, type ModelProvider } from '../ai/provider';
 import { registerAvailableProviders } from '../ai/providers';
+import { handleCompanyResolve } from './handlers/company-resolve';
 import { ExtractBlocked, handleWebExtract } from './handlers/web-extract';
 import { handleWebFetch } from './handlers/web-fetch';
 import { reap, DEFAULT_STALE_AFTER_SECONDS } from './reaper';
@@ -250,11 +251,18 @@ async function main(): Promise<void> {
   // asks the fetcher, which is the only process that touches hostile input.
   const fetcherUrl = config.FETCHER_URL;
   const sharedSecret = config.FETCHER_SHARED_SECRET;
+  const appPool = createPool(config.DATABASE_URL);
   registerHandler('web.fetch', async (job) => {
-    await handleWebFetch(job, { fetcherUrl, sharedSecret });
+    await handleWebFetch(job, { fetcherUrl, sharedSecret, pool: appPool });
   });
 
-  const appPool = createPool(config.DATABASE_URL);
+  // Day 5 registers company.resolve: §10 stages 1-3, code only. It calls no
+  // provider, reserves no budget and reads no page — it normalises the domain,
+  // applies the two hard filters a domain can answer, and fans out at most six
+  // web.fetch jobs, one per page (§6, §7, §10 stage 3).
+  registerHandler('company.resolve', async (job) => {
+    await handleCompanyResolve(job, { pool: appPool });
+  });
 
   // Day 4 registers web.extract. The provider is resolved once, at boot, and
   // resolveProvider throws when MODEL_PROVIDER is unset — §1 freezes the choice

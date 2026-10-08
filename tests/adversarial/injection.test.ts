@@ -359,6 +359,99 @@ describe('CASE 8: next_urls pointing at link-local and off-domain hosts', () => 
   });
 });
 
+/**
+ * CASE 8, continued: the filter after the Public Suffix List replaced host
+ * equality (Day 5).
+ *
+ * §8's words have always been "the same registrable domain". Day 4 implemented
+ * host equality as a placeholder and said so in the code. The relaxation is one
+ * thing only — a legitimate subdomain of the firm's own eTLD+1 is now first
+ * party — and these cases exist to prove that nothing else moved, because a
+ * widened domain test is exactly where a hole would hide.
+ */
+describe('CASE 8 (Day 5): next_urls against the registrable domain', () => {
+  it('accepts a legitimate subdomain of the firm, which host equality refused', () => {
+    expect(filterNextUrls(['https://www.harbourline.example/about'], SOURCE_URL)).toStrictEqual([
+      'https://www.harbourline.example/about',
+    ]);
+    expect(filterNextUrls(['https://nsw.harbourline.example/contact'], SOURCE_URL)).toStrictEqual([
+      'https://nsw.harbourline.example/contact',
+    ]);
+  });
+
+  it('still drops every host whose registrable domain is not the firm’s', () => {
+    for (const candidate of [
+      // A sibling registrable domain under the same public suffix.
+      'https://notharbourline.example/about',
+      // The firm's whole domain used as a label of someone else's.
+      'https://harbourline.example.attacker.tld/about',
+      'https://harbourline.example.evil/about',
+      // A label that merely starts with it.
+      'https://harbourline.example-defence.tld/about',
+      // The firm's name as a path on another domain.
+      'https://attacker.tld/harbourline.example/about',
+      // Homoglyph: a Cyrillic а, so a different registrable domain.
+      'https://hаrbourline.example/about',
+      // No registrable domain at all.
+      'http://169.254.169.254/about',
+      'https://203.0.113.10/about',
+      'https://example/about',
+    ]) {
+      expect(filterNextUrls([candidate], SOURCE_URL), candidate).toStrictEqual([]);
+    }
+  });
+
+  it('drops the whole list when the page it came from has no registrable domain', () => {
+    // No eTLD+1 means there is no "same firm" to be on, so there is nothing the
+    // suggestion could be first-party to.
+    for (const source of ['https://203.0.113.10/', 'https://example/', 'not-a-url']) {
+      expect(
+        filterNextUrls(['https://harbourline.example/about', '/about'], source),
+        source,
+      ).toStrictEqual([]);
+    }
+  });
+
+  it('keeps every other rule intact on a subdomain, not just on the apex', () => {
+    // The relaxation is about the domain and nothing else. Each of these is on
+    // the firm's own registrable domain and still refused.
+    for (const candidate of [
+      'https://www.harbourline.example:8080/about',
+      'https://user:pass@www.harbourline.example/about',
+      'https://www.harbourline.example/a/b/c',
+      'https://www.harbourline.example/wp-admin',
+      'https://www.harbourline.example/cgi-bin/login',
+      'javascript:alert(1)',
+      'data:text/html,<script>1</script>',
+      'file:///etc/passwd',
+    ]) {
+      expect(filterNextUrls([candidate], SOURCE_URL), candidate).toStrictEqual([]);
+    }
+  });
+
+  it('counts a subdomain against the five-URL cap like any other page', () => {
+    const many = [
+      ...Array.from({ length: 4 }, (_u, i) => `https://harbourline.example/offices/${i}`),
+      ...Array.from({ length: 4 }, (_u, i) => `https://www.harbourline.example/team/${i}`),
+    ];
+    expect(filterNextUrls(many, SOURCE_URL)).toHaveLength(5);
+  });
+
+  it('treats the apex and a subdomain as different pages, and dedupes exactly', () => {
+    // Same firm, genuinely different URLs: both legitimate, neither a duplicate.
+    expect(
+      filterNextUrls(
+        [
+          'https://harbourline.example/about',
+          'https://harbourline.example/about',
+          'https://www.harbourline.example/about',
+        ],
+        SOURCE_URL,
+      ),
+    ).toStrictEqual(['https://harbourline.example/about', 'https://www.harbourline.example/about']);
+  });
+});
+
 describe('CASE 9: oversized body and the size caps', () => {
   it('truncates at the §8 input cap and says so', async () => {
     const { provider } = compliantProvider({

@@ -2,13 +2,15 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import type { Pool } from 'pg';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { AUTH_HEADER } from '../../src/fetcher/contract';
 import { createFetcherServer } from '../../src/fetcher/server';
 import { FROZEN_POLICY, type FetchPolicy } from '../../src/fetch/policy';
 import { HostPoliteness } from '../../src/fetch/politeness';
+import { EXTRACTION_SCHEMA_VERSION } from '../../src/ai/schemas/extraction-v1';
 import { enqueue } from '../../src/jobs/enqueue';
+import { dedupeKey } from '../../src/jobs/kinds';
 import { claimJob, completeJob, failJob } from '../../src/jobs/queue';
 import { handleWebFetch, MAX_PAGES_PER_JOB, webFetchPayloadSchema } from '../../src/worker/handlers/web-fetch';
 import { createTestDatabase, hasDatabase, type TestDatabase } from '../helpers/testDb';
@@ -81,6 +83,13 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     fetcherUrl = `http://127.0.0.1:${(service.address() as AddressInfo).port}`;
   }, 120_000);
 
+  afterEach(async () => {
+    // Each case claims the next queued job, and web.fetch now leaves
+    // web.extract jobs behind it, so the queue is reset between cases. The
+    // snapshots stay: several cases read web_snapshots directly.
+    await db.resetQueue();
+  });
+
   afterAll(async () => {
     service?.close();
     origin?.close();
@@ -88,7 +97,10 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
   });
 
   function deps() {
-    return { fetcherUrl, sharedSecret: SECRET };
+    // The pool is required: web.fetch enqueues web.extract per stored snapshot
+    // (§6), and a handler that skipped its successor without one would be a
+    // pipeline that stops silently.
+    return { fetcherUrl, sharedSecret: SECRET, pool: app };
   }
 
   async function claimFetchJob(urls: string[], maxAttempts?: number) {
@@ -96,12 +108,20 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
       kind: 'web.fetch',
       dedupeKey: `fetch:${companyId}:${Math.random().toString(36).slice(2)}:2026-10-06`,
       traceId: TRACE,
+      // Claimed ahead of the web.extract jobs this handler now leaves behind:
+      // the claim orders by priority DESC, and several cases fetch twice.
+      priority: 10,
       payload: { company_id: companyId, urls },
       ...(maxAttempts === undefined ? {} : { maxAttempts }),
     });
     const job = await claimJob(app, 'test-worker');
     if (job === undefined) {
       throw new Error('no job claimed');
+    }
+    // The handler now enqueues web.extract per stored snapshot (§6), so the
+    // queue is no longer web.fetch-only and a blind claim could pick one up.
+    if (job.kind !== 'web.fetch') {
+      throw new Error(`claimed a ${job.kind} job; the queue was not clean`);
     }
     return job;
   }
@@ -142,7 +162,7 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     // only the privileged zone can read it.
     expect(JSON.stringify(result)).not.toContain('page at');
     expect(Object.keys(result).sort()).toStrictEqual([
-      'extractableSnapshotIds', 'httpError', 'httpUnavailable',
+      'extractableSnapshotIds', 'extractsEnqueued', 'httpError', 'httpUnavailable',
       'refused', 'robotsDisallowed', 'stored',
     ]);
   }, 60_000);
@@ -166,7 +186,7 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
   it('fails rather than proceeding when the fetcher rejects its credentials', async () => {
     const job = await claimFetchJob([`${originUrl}/about`]);
     await expect(
-      handleWebFetch(job, { fetcherUrl, sharedSecret: 'wrong-secret' }),
+      handleWebFetch(job, { ...deps(), sharedSecret: 'wrong-secret' }),
     ).rejects.toThrow(/fetcher returned 401/);
   }, 60_000);
 
@@ -182,8 +202,8 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
       const job = await claimFetchJob([`${originUrl}/about`]);
       await expect(
         handleWebFetch(job, {
+          ...deps(),
           fetcherUrl: `http://127.0.0.1:${(liar.address() as AddressInfo).port}`,
-          sharedSecret: SECRET,
         }),
       ).rejects.toThrow(/failed validation/);
     } finally {
@@ -202,8 +222,8 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     try {
       const job = await claimFetchJob([`${originUrl}/about`]);
       await handleWebFetch(job, {
+        ...deps(),
         fetcherUrl: `http://127.0.0.1:${(spy.address() as AddressInfo).port}`,
-        sharedSecret: SECRET,
       }).catch(() => undefined);
       expect(seenHeader).toBe(SECRET);
     } finally {
@@ -258,6 +278,61 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
     }, 60_000);
   });
 
+  describe('§6: enqueues web.extract per snapshot', () => {
+    async function extractJobs() {
+      const { rows } = await app.query<{
+        dedupe_key: string;
+        payload: Record<string, unknown>;
+        parent_job_id: string | null;
+      }>(`SELECT dedupe_key, payload, parent_job_id FROM jobs WHERE kind = 'web.extract'`);
+      return rows;
+    }
+
+    it('enqueues one extract per stored page, keyed by §7’s permanent key', async () => {
+      const job = await claimFetchJob([`${originUrl}/`, `${originUrl}/about`]);
+      const result = await handleWebFetch(job, deps());
+      expect(result.stored).toBe(2);
+      expect(result.extractsEnqueued).toBe(2);
+
+      const jobs = await extractJobs();
+      expect(jobs).toHaveLength(2);
+      expect(jobs.map((row) => row.dedupe_key).sort()).toStrictEqual(
+        [...result.extractableSnapshotIds]
+          .map((id) => dedupeKey.webExtract(id, EXTRACTION_SCHEMA_VERSION))
+          .sort(),
+      );
+      for (const row of jobs) {
+        expect(row.parent_job_id).toBe(job.id);
+        expect(Object.keys(row.payload)).toStrictEqual(['snapshot_id']);
+      }
+    }, 60_000);
+
+    it('enqueues nothing for a page that may never be evidence', async () => {
+      // A 4xx row and a robots row both exist with text NULL. Neither is
+      // extractable, so neither produces a job that would reserve budget.
+      const errorJob = await claimFetchJob([`${originUrl}/status/403`]);
+      expect((await handleWebFetch(errorJob, deps())).extractsEnqueued).toBe(0);
+      expect(await extractJobs()).toHaveLength(0);
+
+      const robotsJob = await claimFetchJob([`${originUrl}/private/page`]);
+      expect((await handleWebFetch(robotsJob, deps())).extractsEnqueued).toBe(0);
+      expect(await extractJobs()).toHaveLength(0);
+    }, 60_000);
+
+    it('does not enqueue a second time for the same snapshot', async () => {
+      // §7's extract key is permanent, so a replayed fetch of unchanged bytes
+      // produces the same key and inserts nothing.
+      const first = await claimFetchJob([`${originUrl}/about`]);
+      expect((await handleWebFetch(first, deps())).extractsEnqueued).toBe(1);
+
+      const second = await claimFetchJob([`${originUrl}/about`]);
+      const result = await handleWebFetch(second, deps());
+      expect(result.stored).toBe(1);
+      expect(result.extractsEnqueued).toBe(0);
+      expect(await extractJobs()).toHaveLength(1);
+    }, 60_000);
+  });
+
   describe('through the real queue (§6)', () => {
     it('a 403 job succeeds on its first attempt, having asked once', async () => {
       requests = [];
@@ -273,6 +348,55 @@ describeWithDb('the web.fetch handler: worker to fetcher over the internal netwo
       expect(rows[0]?.attempts).toBe(1);
       expect(requests.filter((path) => path === '/status/403')).toHaveLength(1);
     }, 60_000);
+
+    it('retries the 5xx page without ever asking the 4xx page again (Day 5)', async () => {
+      // This is ops/day3-acceptance/findings.md's "Known residual, bounded and
+      // deliberate", closed. The residual was a single job carrying both URLs:
+      // the 5xx made the job fail, the retry re-ran the whole payload, and the
+      // 404 — which had already given its final answer — was requested again.
+      //
+      // The fix is structural rather than a change to the retry rules: since
+      // company.resolve fans out one job per page (§7's key is per URL), the
+      // two pages have separate jobs and separate attempt budgets. Nothing
+      // about terminal-vs-retryable moved.
+      requests = [];
+      const terminal = await claimFetchJob([`${originUrl}/status/404`], 3);
+      await handleWebFetch(terminal, deps());
+      await completeJob(app, terminal);
+
+      let transient = await claimFetchJob([`${originUrl}/status/503`], 2);
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const failure = await handleWebFetch(transient, deps()).then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        expect(failure).toBeInstanceOf(Error);
+        const outcome = await failJob(app, transient, failure);
+        if (outcome.status === 'dead') {
+          break;
+        }
+        await db.adminPool.query('UPDATE jobs SET run_after = now() WHERE id = $1', [transient.id]);
+        const next = await claimJob(app, 'test-worker');
+        if (next === undefined) {
+          throw new Error('the job did not return to the queue');
+        }
+        transient = next;
+      }
+
+      // The 503 was asked once per attempt, as §6 intends.
+      expect(requests.filter((path) => path === '/status/503')).toHaveLength(2);
+      // The 404 was asked exactly once, in total, ever. That is the residual.
+      expect(requests.filter((path) => path === '/status/404')).toHaveLength(1);
+
+      const rows = await app.query<{ id: string; status: string; attempts: number }>(
+        'SELECT id, status::text AS status, attempts FROM jobs WHERE id = ANY($1::uuid[])',
+        [[terminal.id, transient.id]],
+      );
+      const byId = new Map(rows.rows.map((row) => [row.id, row]));
+      // One page answered and is finished; the other exhausted its own budget.
+      expect(byId.get(terminal.id)).toMatchObject({ status: 'succeeded', attempts: 1 });
+      expect(byId.get(transient.id)).toMatchObject({ status: 'dead', attempts: 2 });
+    }, 120_000);
 
     it('a 503 job exhausts its budget and goes dead, asking once per attempt', async () => {
       requests = [];

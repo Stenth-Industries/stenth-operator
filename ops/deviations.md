@@ -256,3 +256,141 @@ writes a `job.requeued` event with `actor_type = 'human'` carrying the
 successful abandonment and by nothing else. "Silently" is the word §6 turns on,
 and this is attributable, bounded by the original attempt budget, and never
 automatic.
+
+---
+
+# Day 5 deviations
+
+Recorded 2026-10-08, with the frozen §25 milestone table in front of me.
+
+## 13. What was built is not §25's Day 5
+
+**This is the first thing a reader needs to know.** §25's Day 5 row is:
+
+> Eval harness: fixture format, snapshot sanitiser, frozen snapshots,
+> eval/run.ts, metrics, markdown report, dev/holdout split. **Kushagra labels 60
+> fixtures.**
+
+and the paragraph under the table says, in the spec's own words: "Day 5 is still
+the critical path and it is still not Claude Code's work." None of that was
+built. The eval harness cannot be finished here — its exit criterion is a
+baseline measured over 60 human-labelled fixtures, and the labels are the input,
+not the output.
+
+What was built instead is `company.resolve`: §10 stages 1–3, which §25 places
+under Day 6's "code filters" and which Day 3's own handoff calls Day 5's work —
+`ops/day3-acceptance/findings.md`: "a design decision for Day 5 — when
+`company.resolve` starts fanning out to §10's six pages", and
+`src/pipeline/domain.ts`: "until `company.resolve` separately verifies that the
+other domain belongs to the same firm, which is Day 5's work and does not exist
+yet." Two files in the repo already called this Day 5, so the name was taken
+before today.
+
+Nothing here is rubric, scoring or threshold work: §10 stages 4–7 are untouched,
+and so is every number Day 6 has to derive. The milestone order changed; no
+milestone's content did.
+
+## 14. One `web.fetch` job per page, not one job carrying six URLs
+
+§6 says web.fetch "Asks the fetcher service for up to 6 pages", which reads as
+one job with six URLs, and the payload schema has always accepted up to six.
+`company.resolve` emits one URL per job instead.
+
+§7 is the evidence: the web.fetch key is `fetch:{company_id}:{url_hash}:{date}`,
+singular, one key per URL. A job carrying six URLs has one key for six pieces of
+work and — the part that matters — one retry budget. That is exactly Day 3's
+recorded residual: "a job carrying several URLs where one page is 4xx and another
+is 5xx retries because of the 5xx, and the 4xx URL is requested again on that
+attempt. Avoiding it needs per-URL state across attempts, which is a design
+decision for Day 5."
+
+Per-URL state across attempts is a per-URL job. No new table, no new state, and
+no change to the terminal/retryable split in `src/fetcher/contract.ts` — the
+4xx job succeeds on its first attempt and is never asked again, the 5xx job
+retries alone. Politeness is unaffected because the fetcher's token bucket is
+keyed by host, not by job. The six-URL ceiling stays on the payload schema,
+where it protects the fetcher from any caller.
+
+The payload gains one optional field, `page_kind`. It is provenance, not an
+option: `fetchRequestSchema` is strict and takes company_id, url and trace_id,
+so it never reaches the fetcher. It exists so the 404 rate per page kind is
+measurable, which is the evidence deviation 15 needs.
+
+## 15. The candidate paths are a first pass, and page discovery is undecided
+
+§10 stage 3 freezes the six page *kinds* — "home, about, services or practice
+areas, contact, team, one location page". It does not say what a firm calls them,
+and **nothing in the repo knows**: `src/fetch/signals.ts` counts location links,
+it does not collect them, and no page URL has ever been harvested from a stored
+snapshot. So `PAGE_PATHS` in `src/pipeline/resolve.ts` asks for one conventional
+path per kind and accepts that some will 404.
+
+That is bounded by Day 3's own correction — a 4xx is terminal, writes a text-free
+diagnostic row, is never evidence and is never retried — but it is a quality
+cost, not a free one: a firm whose about page is `/our-firm` loses that page.
+
+**The open decision, not made here.** The alternative is to harvest candidate
+links from the homepage's markup deterministically (no model call: the scanner
+already runs over the HTML before `html-to-text` drops the links) and classify
+them into the six kinds. That is better fan-out and it is also a new capability
+crossing the fetcher boundary — URLs from a hostile page, which would have to
+pass the same filter `next_urls` does. It needs approval, so it was not built.
+
+`practice_areas` rather than `services` because §9 and §10 use "practice areas"
+throughout as the thing to extract and to score, and `practice_area_priors` is a
+table. The spec's own vocabulary is the only evidence available; both spellings
+pass the path allowlist either way.
+
+## 16. `company.resolve` writes the `prospects` row
+
+§4 calls prospects "the pipeline row" and §6 does not say which stage creates it.
+It is created here, at stage 1, on the evidence of §10 stage 1 itself: "Reject if
+suppressed or **already a prospect in this campaign**" can only be a dedupe test
+if resolve is what writes it. `prospect_stage`'s first value is `discovered`,
+which is the resolve stage and not the assess stage, and §4's unique index on
+(company_id, campaign_id) is the constraint that makes the test free.
+
+The company row, its `company_sources` row, the prospect row and all six
+enqueues commit in one transaction. That is load-bearing, not tidiness: a crash
+between the prospect insert and the fan-out would otherwise leave a firm that
+reads as "already a prospect" with nothing queued, stalled for ever. A
+reliability case drives exactly that rollback.
+
+## 17. `next_urls` now asks the Public Suffix List (closing Day 3 finding 2)
+
+§8 has always said "code filters it to the same registrable domain". Day 4
+implemented host equality and said so in the code: "that list arrives with
+company.resolve on Day 5, and host equality is the stricter of the two, so it is
+safe to tighten now and relax later." It now asks `src/pipeline/domain.ts`.
+
+One thing relaxed: a legitimate subdomain of the firm's own eTLD+1 is first
+party, which is the policy already approved for `src/pipeline/evidence.ts`.
+Nothing else moved — protocol, credential rejection, allowed ports, the path
+allowlist, depth, the five-URL cap and deduplication are all unchanged, and six
+adversarial cases assert each of them *on a subdomain* rather than only on the
+apex, because a widened domain test is where a hole would hide.
+
+Host equality was never stricter where it mattered. It could not tell
+`firm.com.au` from `firm.com.au.attacker.tld` on principle, only by the accident
+of two strings differing.
+
+## 18. `web.fetch` now enqueues `web.extract` (§6), which Day 3 deferred
+
+`src/worker/handlers/web-fetch.ts` said: "web.extract is Day 4, so this stores
+snapshots and stops there; the enqueue arrives with the handler that can act on
+it." The handler exists, so the enqueue is wired, per §6's "Enqueues next:
+web.extract per snapshot" — only for `EXTRACTABLE_OUTCOMES`, so a robots row and
+a 4xx row still produce nothing.
+
+The pool became a *required* dependency rather than an optional one. A handler
+that silently skips its successor when a dependency is missing is a pipeline
+that stops with no error, and "the enqueue only happens in production" is not a
+property a test can check.
+
+**What this means for a deployment with model calls disabled**, which is the
+current production state: every fetched page now produces a `web.extract` job,
+and each one is blocked with `model_calls_disabled` before any reservation
+exists. No provider is contacted and no budget is consumed. Those jobs are
+terminal until a human requeues them, which is what `requeueBlockedJob` and
+`ops/day4-extraction/reconcile.ts` are for. Nothing enqueues `company.resolve`
+in production, so none of this starts on its own.

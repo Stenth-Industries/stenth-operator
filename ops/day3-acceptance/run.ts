@@ -28,7 +28,6 @@
  *             close a shortfall, not to be fetched as a matter of course.
  *   report    read-only; prints the acceptance table and the accepted count.
  */
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -37,7 +36,7 @@ import { z } from 'zod';
 
 import { createPool } from '../../src/db/client';
 import { enqueue } from '../../src/jobs/enqueue';
-import { dedupeKey } from '../../src/jobs/kinds';
+import { dedupeKey, fetchUrlHash } from '../../src/jobs/kinds';
 import { newTraceId } from '../../src/obs/trace';
 
 /**
@@ -190,8 +189,7 @@ function homepageOf(site: Site): string {
  * what identifies the work.
  */
 function keyFor(companyId: string, urls: readonly string[], occurrence: string): string {
-  const urlHash = createHash('sha256').update(urls.join('\n'), 'utf8').digest('hex').slice(0, 16);
-  return dedupeKey.webFetch(companyId, urlHash, occurrence);
+  return dedupeKey.webFetch(companyId, fetchUrlHash(urls), occurrence);
 }
 
 interface CompanyRow {
