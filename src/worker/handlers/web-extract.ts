@@ -162,8 +162,14 @@ async function loadSnapshot(
  *
  * A NULL scan is `unknown`, not `absent`. Only the scanner may say absent,
  * because only the scanner has looked — and §10 pays 35 points for absence.
+ *
+ * Exported for the Day 5 eval harness, which freezes this exact block into its
+ * fixtures. The alternative was a second implementation of "absent versus
+ * unknown", which is a second chance to get §9 wrong — and the corpus is the
+ * ground truth Day 6's thresholds come from, so a divergence there would be
+ * invisible and load-bearing. Nothing else about this function changed.
  */
-function assembleSignals(signals: TierASignals | null): ExtractionPayload['signals'] {
+export function assembleSignals(signals: TierASignals | null): ExtractionPayload['signals'] {
   const presence = (value: boolean): 'present' | 'absent' =>
     value ? 'present' : 'absent';
 

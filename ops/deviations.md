@@ -549,3 +549,116 @@ preference is untouched.
 
 No model call, no provider choice, no migration, no new grant: the reversal is a
 branch in one handler function and five extra rows in the jobs table.
+
+---
+
+# Day 5, the real one: the eval harness
+
+Recorded 2026-10-10. §25's Day 5 row — "Eval harness: fixture format, snapshot
+sanitiser, frozen snapshots, eval/run.ts, metrics, markdown report, dev/holdout
+split. Kushagra labels 60 fixtures" — is now built, except for the two parts of
+it that are not software. Deviation 13 recorded that this had been skipped; it is
+no longer skipped, and deviation 13 stands as written.
+
+## 22. `assembleSignals` is exported from the web.extract handler
+
+One word added to a production file, no behaviour changed. The eval fixture
+freezes §9's Tier A block, and §9 makes `unknown` a first-class answer distinct
+from `absent` — only the scanner may say absent, and §10 pays 35 points for
+absence.
+
+A second implementation of that mapping inside the harness would have been a
+second chance to get it wrong, and the corpus is the ground truth Day 6's
+thresholds are derived from, so a divergence there would be both invisible and
+load-bearing. The function is pure and already had exactly the right shape, so it
+is imported rather than restated.
+
+## 23. No dev/holdout ratio is invented; the counts are the operator's
+
+§25 says "dev/holdout split" and the repository preserves no authoritative ratio
+— no percentage, no count, nothing in §21 or §25. So `eval:split` requires
+`--dev-count` and `--holdout-count` and refuses to run without them, and writes
+the result to a checked-in `split.json`. Both safe designs together: the counts
+decide how many, the committed manifest decides which, for ever.
+
+The manifest is **append-only**. A domain already in it keeps its split; adding
+fixtures later assigns only the new ones; moving one requires `--rebuild --yes`.
+A fixture that drifts from holdout to dev has been tuned against, and that would
+happen by accident — a re-run with different counts, a fixture added in the
+middle — long before anyone did it deliberately.
+
+Assignment order is `sha256(fixture_set + "\n" + domain)`, and `eval/split.ts`
+does not import the labels file. A holdout chosen by looking at labels encodes
+the ground truth into the partition, which is leakage by construction; the module
+cannot do it because it cannot read them.
+
+## 24. A fixture carries no timestamps at all, including no freeze time
+
+The brief's list of unstable fields to exclude named row uuids, trace ids, worker
+ids and `created_at`/`updated_at`. A freeze timestamp is not on that list and
+would have been defensible as provenance — it is excluded anyway.
+
+A fixture's identity is its content. With no timestamp, re-freezing unchanged
+evidence produces byte-identical output, so `--replace` on an unchanged corpus is
+a visible no-op and a `git diff` over the corpus means something. Freeze-time
+provenance that actually matters (which set, which domain, which URL, which
+content hash) is all stable and all present. `labelled_at` is a timestamp and it
+lives in `labels.json`, because when a person decided is a fact about the person,
+not about the evidence.
+
+## 25. `uncertain` is a prediction that matches no label, and is counted as such
+
+§4 gives `eval_fixtures.label` two values and `eval_results.predicted_verdict`
+three, because `verdict` is `qualified | uncertain | rejected`. That is not an
+inconsistency to paper over: §10 stage 7's gate is "Qualified, uncertain or
+rejected", and ground truth is a decision a person actually made.
+
+So `uncertain` is counted in its own right. It is never correct; it is not a
+false qualification (nobody was contacted) and not a false rejection (the firm
+was not discarded); it stays out of precision denominators and inside recall
+denominators. The confusion matrix has a column for it rather than folding it
+into either side.
+
+Every rate is `null` when its denominator is zero, rendered as an em dash. A
+report that said "qualified precision 0.0000" for a run that predicted nothing
+qualified would be stating a result it does not have.
+
+## 26. No predictor ships, and `eval:run` says so
+
+§25 puts the rubric, `practice_area_priors`, the grounding filter, the thresholds
+and the provider bake-off on **Day 6**. The harness therefore ships with a
+typed predictor seam and no real predictor: `eval:run` without `--predictor`
+prints that none exists rather than producing a number, and `hasRealPredictor()`
+returns false.
+
+`test-only-scripted` answers from a script, reads no evidence, requires
+`--allow-test-predictor`, and stamps a warning banner on any report it touches.
+It exists so the runner, the metrics and the report could be tested end to end. A
+predictor that inspected the fixture and guessed would have been worse, because
+it would have produced plausible numbers.
+
+`eval_runs.rubric_version` and `prompt_version` are `NOT NULL`, so the runner
+requires both on the command line and defaults neither. Day 6 owns the rubric;
+this tool will not invent a version string for it.
+
+## 27. `eval/` is a new top-level directory, and §19 already names it
+
+§19 rule 1 forbids a new top-level directory without a written reason. No reason
+is needed here beyond pointing at §19's own tree, which lists
+`eval/ fixtures/, run.ts, report.ts`. The directory was always in the plan; this
+is the day it exists. `eval/**/*.ts` was added to `tsconfig.json`'s `include` so
+typecheck covers it, and `tests/eval/` follows the existing `tests/adversarial/`
+precedent for a third suite category.
+
+## 28. No migration, and the one place the schema pinches
+
+§4's `eval_fixtures`, `eval_runs` and `eval_results` were enough as they stand.
+Nothing was added, altered or dropped.
+
+The one place it pinches, recorded because a future reader will hit it:
+`eval_fixtures.label` is `NOT NULL`, so a row cannot exist for an unlabelled
+fixture. An unlabelled fixture is a real and common state of a corpus on its way
+to sixty. Rather than add a nullable column — or worse, write a placeholder label
+— the **files** are the source of truth and the DB rows are metadata written only
+for fixtures a human has already decided. That is also what the brief asked for,
+and it means the schema never has to represent a label nobody gave.

@@ -27,6 +27,7 @@
     "src/**/*.tsx",
     "tests/**/*.ts",
     "ops/**/*.ts",
+    "eval/**/*.ts",
     "*.ts",
     ".next/types/**/*.ts"
   ],

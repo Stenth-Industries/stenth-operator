@@ -15,7 +15,13 @@
     "lint": "node scripts/lint-no-mail.mjs",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
-    "test:reliability": "vitest run tests/reliability"
+    "test:reliability": "vitest run tests/reliability",
+    "test:eval": "vitest run tests/eval",
+    "eval:freeze": "tsx eval/freeze.ts",
+    "eval:label": "tsx eval/label-cli.ts",
+    "eval:split": "tsx eval/split-cli.ts",
+    "eval:status": "tsx eval/status.ts",
+    "eval:run": "tsx eval/run.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.44.6",
